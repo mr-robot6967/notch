@@ -68,13 +68,15 @@ final class Updater: ObservableObject {
         request.timeoutInterval = 20
         Task {
             let result = try? await URLSession.shared.data(for: request)
-            self.lastChecked = Date()
             guard let (data, response) = result, (response as? HTTPURLResponse)?.statusCode == 200,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = json["tag_name"] as? String else {
                 self.state = .failed("Couldn't reach GitHub. Try again later.")
                 return
             }
+            // Only a check that got an answer counts for the 20 h auto-check gate: stamping failures
+            // too meant one offline launch (Wi-Fi not up yet 30 s after login) skipped a whole day.
+            self.lastChecked = Date()
             let version = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
             let assets = json["assets"] as? [[String: Any]] ?? []
             let dmg = assets.first { ($0["name"] as? String)?.lowercased().hasSuffix(".dmg") == true }

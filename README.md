@@ -2,7 +2,7 @@
 
 Notch turns the top of your Mac's screen into a live "island" and puts widgets on the real macOS lock screen. It runs from the menu bar and uses live data from your Mac.
 
-- **Island:** album art and a waveform while music plays; volume and brightness levels; charging, low battery, AirPods/Bluetooth connections, timer, Focus and calendar alerts; other apps' notifications (optional). Hover or click to open a player with seek, like/shuffle/repeat and output-device switching, plus pages for widgets, a file shelf (with AirDrop) and a timer. When nothing is playing (or a song has been paused for a minute) the closed island shows the weather, "Not playing" or nothing (Settings › Island › Behaviour › More options).
+- **Island:** album art and a waveform while music plays; volume and brightness levels; charging, low battery, AirPods/Bluetooth connections, timer, Focus and calendar alerts; other apps' notifications (optional). Hover or click to open a player with seek, like/shuffle/repeat and output-device switching, plus pages for widgets, a file shelf (with AirDrop) and a timer. When nothing is playing (or a song has been paused for a few seconds) the closed island shows the weather, "Not playing" or nothing (Settings › Island › Behaviour › More options).
 - **File shelf:** drop anything on the notch (files, folders, images, links, text; several at once) and drag it back out later. It holds the 10 newest items and keeps them across launches.
 - **Lock screen:** weather, air quality, Mac and AirPods/Bluetooth batteries, next event and forecast, and a working music player. You can place everything in a live preview of your own lock screen.
 - **Optional desktop widgets**, Discord "Listening to…" status, and Spotify extras.

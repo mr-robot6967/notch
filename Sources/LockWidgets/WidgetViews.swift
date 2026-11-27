@@ -771,9 +771,14 @@ struct MacBatteryWidget: View {
         let time: String? = settings.config.showTimeRemaining
             ? b.minutesRemaining.map { String(format: "%d:%02d", $0 / 60, $0 % 60) }
             : nil
-        if b.isCharging { return time.map { "Charging · \($0) to full" } ?? "Charging" }
-        if b.isPluggedIn { return b.chargeState == .charged ? "Fully charged" : "Charging on hold" }
-        return time.map { "On battery · \($0) left" } ?? "On battery"
+        // Follow chargeState, like the island: plugged in and not charging *yet* (no reason from
+        // macOS, charger still negotiating) is "Charging", not "Charging on hold".
+        switch b.chargeState {
+        case .charging: return b.isCharging ? (time.map { "Charging · \($0) to full" } ?? "Charging") : "Charging"
+        case .charged: return "Fully charged"
+        case .onHold: return "Charging on hold"
+        case .onBattery: return time.map { "On battery · \($0) left" } ?? "On battery"
+        }
     }
 }
 

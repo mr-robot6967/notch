@@ -178,6 +178,22 @@ final class SpotifyClient: ObservableObject {
                 Task { await self.refreshTrackState() }
             }
             .store(in: &cancellables)
+        // "Match likes saved from other releases" changed: cached hearts were worked out under the old
+        // setting for up to 10 min. With matching turned off a cached match kept the heart filled,
+        // and an unlike would still delete that other saved release. Forget them and ask again.
+        AppSettings.shared.$config
+            .map(\.spotifyMatchReleases)
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.likedCache = [:]
+                self.matchedSavedID = nil
+                guard self.connected, MediaController.shared.info?.bundleIdentifier == "com.spotify.client" else { return }
+                Task { await self.refreshTrackState() }
+            }
+            .store(in: &cancellables)
         // After sleep the network comes back a few seconds late; re-check then (with retries).
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in

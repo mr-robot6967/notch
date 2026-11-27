@@ -78,6 +78,9 @@ struct NotchRootView: View {
             }
             // Any kind of item (files, folders, images, links, text), several per drag.
             .onDrop(of: ShelfModel.acceptedTypes, isTargeted: $model.dropTargeted) { providers in
+                // With the File Shelf page turned off the items would be stored on a shelf that
+                // can't be seen (or emptied); refuse the drop so it springs back to its source.
+                guard settings.config.notchPages.contains(NotchPage.shelf.rawValue) else { return false }
                 ShelfModel.shared.accept(providers)
                 return true
             }
@@ -410,6 +413,7 @@ private struct CompactActivity: View {
         case .idleWeather:
             if let w = WidgetStore.shared.weather {
                 Text("\(Int(w.temperature.rounded()))°").monospacedDigit().foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1).fixedSize() // one line, like every other compact activity
             }
         case .idleNotPlaying:
             Text("Not playing").foregroundStyle(.white.opacity(0.55)).lineLimit(1).fixedSize()

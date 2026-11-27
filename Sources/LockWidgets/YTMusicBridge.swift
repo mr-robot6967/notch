@@ -96,7 +96,7 @@ final class YTMusicBridge: ObservableObject {
             needsAppleEvents = "Allow Notch to control \(browser.app) in System Settings › Privacy & Security › Automation."
         } else if error.localizedCaseInsensitiveContains("javascript") || error.localizedCaseInsensitiveContains("apple event") {
             needsAppleEvents = browser.safari
-                ? "In Safari, turn on Develop › Allow JavaScript from Apple Events."
+                ? "In Safari, turn on Settings › Developer › Allow JavaScript from Apple Events."
                 : "In \(browser.app), turn on View › Developer › Allow JavaScript from Apple Events."
         }
     }

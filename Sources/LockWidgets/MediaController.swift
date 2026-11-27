@@ -92,7 +92,7 @@ final class MediaController: ObservableObject {
     static let pausedGrace: TimeInterval = 3
     private var pauseExpiry: DispatchWorkItem?
 
-    /// The collapsed island should still show the current song (playing, or paused < 60 s).
+    /// The collapsed island should still show the current song (playing, or paused < `pausedGrace`).
     var songIsRecent: Bool {
         guard let info else { return false }
         if info.isPlaying { return true }

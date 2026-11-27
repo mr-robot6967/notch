@@ -315,6 +315,22 @@ final class ShelfModel: ObservableObject {
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         items = Array(existing.suffix(Self.capacity))
         if items.map(\.path) != saved { save() }
+        sweepCache()
+    }
+
+    /// Deletes files in our cache folder that no shelf item points to. Removing/evicting an item
+    /// deletes its file, but files could still be orphaned (a crash between writing a drop and
+    /// saving the list, saved items trimmed above, a failed write), and nothing else would ever
+    /// delete them, so the cache could grow forever. Runs once at launch, before any drop is
+    /// in flight, so it can't race a file that's being written.
+    private func sweepCache() {
+        let fm = FileManager.default
+        let dir = Self.cacheDir.standardizedFileURL
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        let kept = Set(items.map { $0.standardizedFileURL.path })
+        for file in files where !kept.contains(file.standardizedFileURL.path) {
+            try? fm.removeItem(at: file)
+        }
     }
 
     func add(_ urls: [URL]) {
@@ -1077,7 +1093,9 @@ final class NotchController {
         case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * k, height: g.height)
         case .timer: return CGSize(width: g.width + 2 * 70 * k, height: g.height)
         case .locked: return CGSize(width: g.width + 2 * (g.height * 0.8), height: g.height)
-        case .idleWeather: return CGSize(width: g.width + 2 * (g.height * 0.95), height: g.height)
+        // At least 42 pt a side: the 12 pt temperature ("-12°") didn't fit in 0.95 × a short notch
+        // (or the pill on Macs without one) and wrapped/truncated.
+        case .idleWeather: return CGSize(width: g.width + 2 * max(g.height * 0.95, 42), height: g.height)
         case .idleNotPlaying: return CGSize(width: g.width + 2 * 84 * k, height: g.height) // fits "Not playing"
         default: return CGSize(width: g.width + 2 * 50 * k, height: g.height)
         }
@@ -1359,7 +1377,7 @@ enum NotchContent: Equatable {
         }
         if model.locked, cfg.lockedIndicator != "none" { return .locked }
         if NotchTimer.shared.isRunning { return .timer }
-        // Playing, or paused less than a minute ago (MediaController.pausedGrace); after that the
+        // Playing, or paused less than MediaController.pausedGrace (3 s) ago; after that the
         // paused song gives way to the idle content until playback resumes.
         let media = MediaController.shared
         if let info = media.info, media.songIsRecent, !cfg.disabledActivities.contains("nowPlaying"),

@@ -32,7 +32,9 @@ struct MacBatteryInfo: Equatable {
         // Only a real hold counts: macOS gave a reason, or the battery reached the charge limit.
         // Right after plugging in, macOS briefly reports "not charging" with no reason while the
         // charger negotiates — that's charging about to start, not "On Hold".
-        if notChargingReason != 0 || level >= chargeLimit - 1 { return .onHold }
+        // The "within 1 % of the limit" shortcut only applies to a real limit (< 100): with none,
+        // 99 % right after plugging in (no reason yet, charger negotiating) read as "On Hold".
+        if notChargingReason != 0 || (chargeLimit < 100 && level >= chargeLimit - 1) { return .onHold }
         return .charging
     }
 }
@@ -51,7 +53,7 @@ enum MacBattery {
     private static var limitCache: (value: Int, at: Date)?
 
     /// The charge limit from System Settings › Battery: the power daemon's manual charge-limit
-    /// policy (soclimit), falling back to the Battery settings' stored limit. Cached for a minute.
+    /// policy (soclimit); 100 when no limit is active. Cached for a minute.
     static func chargeLimit() -> Int {
         if let cached = limitCache, Date().timeIntervalSince(cached.at) < 60 { return cached.value }
         var limit = 100
@@ -63,11 +65,8 @@ enum MacBattery {
                 if let soc = (object["soclimit"] as? NSNumber)?.intValue, soc > 0, soc <= 100 { limit = min(limit, soc) }
             }
         }
-        if limit == 100, let ui = UserDefaults(suiteName: "com.apple.batteryui.charging.mac"),
-           let stored = ui.object(forKey: "com.apple.batteryui.charging.mac.prior.limit") as? NSNumber,
-           stored.intValue > 0, stored.intValue < 100 {
-            limit = stored.intValue
-        }
+        // Only macOS's active charging policy counts. (The Battery settings' "prior limit" can still say 80
+        // after the limit is switched off, which would show a phantom "On Hold".)
         limitCache = (limit, Date())
         return limit
     }

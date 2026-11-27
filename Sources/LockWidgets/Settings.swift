@@ -146,7 +146,7 @@ struct Config: Codable, Equatable {
     var lockIndicatorMigrated: Bool = true
     var cleanSongTitles: Bool = true
     /// What the collapsed island shows when nothing is playing (or a song has been paused for a
-    /// minute): "weather", "notPlaying" (a dimmed note + "Not playing") or "none" (plain notch).
+    /// few seconds, MediaController.pausedGrace): "weather", "notPlaying" (a dimmed note + "Not playing") or "none" (plain notch).
     /// When nothing plays the island returns to its normal state (plain notch) unless the user picks
     /// "Not playing" or weather in Settings.
     var idleActivity: String = "none"

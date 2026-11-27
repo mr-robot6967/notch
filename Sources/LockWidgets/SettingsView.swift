@@ -1321,8 +1321,14 @@ private struct IntegrationsTab: View {
                     if spotify.connected {
                         Button("Disconnect") { spotify.disconnect() }
                     } else {
-                        Button("Connect Spotify…") { spotify.connect() }
-                            .disabled(settings.config.spotifyClientID.isEmpty)
+                        // Connect with what's in the field: a pasted but unsaved ID used to be
+                        // ignored (Connect stayed disabled, or signed in with the old saved ID).
+                        Button("Connect Spotify…") {
+                            drafts.spotifyID = drafts.spotifyID.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if drafts.spotifyID != settings.config.spotifyClientID { settings.config.spotifyClientID = drafts.spotifyID }
+                            spotify.connect()
+                        }
+                        .disabled(drafts.spotifyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                     Button("Open Spotify Dashboard…") {
                         NSWorkspace.shared.open(URL(string: "https://developer.spotify.com/dashboard")!)
@@ -1337,6 +1343,9 @@ private struct IntegrationsTab: View {
             }
         }
         .formStyle(.grouped)
+        // The welcome (Settings › General › Show Welcome) can save a Client ID while this tab is
+        // alive; keep the field in step so it doesn't show the old ID with Save enabled.
+        .onChange(of: settings.config.spotifyClientID) { _, saved in drafts.spotifyID = saved }
     }
 
     private func appName(_ bundleID: String) -> String {
