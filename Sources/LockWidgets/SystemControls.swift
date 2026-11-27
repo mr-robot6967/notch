@@ -486,14 +486,8 @@ final class MediaKeyTap {
         // Same for mute: without a settable mute property the key was swallowed and did nothing.
         if code == 7 && !MainActor.assumeIsolated({ AudioDevices.canSetMute() }) { return false }
         if [2, 3].contains(code) && (disabled.contains("brightness") || Brightness.get() == nil) { return false }
-        guard isDown else {
-            // macOS plays its volume feedback once, when the key is released.
-            if code == 0 || code == 1 {
-                let shiftUp = ns.modifierFlags.contains(.shift)
-                DispatchQueue.main.async { MainActor.assumeIsolated { VolumeFeedback.play(shiftHeld: shiftUp) } }
-            }
-            return true // swallow key-up too
-        }
+        guard isDown else { return true } // swallow key-up too
+        let shift = ns.modifierFlags.contains(.shift)
         let fine = ns.modifierFlags.contains(.option) && ns.modifierFlags.contains(.shift)
         let step: Float = fine ? 1.0 / 64.0 : 1.0 / 16.0
         DispatchQueue.main.async {
@@ -503,6 +497,8 @@ final class MediaKeyTap {
                     MediaKeyTap.lastVolumeKeyAt = Date()
                     let v = min(1, max(0, AudioDevices.volume() + (code == 0 ? step : -step)))
                     AudioDevices.setVolume((v * 64).rounded() / 64)
+                    // A pop on every step, including key repeats while the key is held — like macOS.
+                    VolumeFeedback.play(shiftHeld: shift)
                     // At 0 % / 100 % CoreAudio reports no change, so show the level (and limit haptic) here.
                     if v <= 0 || v >= 1 {
                         NotchModel.shared.flash(.volume(level: v, muted: AudioDevices.isMuted()), seconds: 1.6)
@@ -542,11 +538,16 @@ enum VolumeFeedback {
         return id
     }()
 
+    private static var lastPlayed = Date.distantPast
+
     static func play(shiftHeld: Bool) {
         let global = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain) ?? [:]
         let enabled = (global["com.apple.sound.beep.feedback"] as? NSNumber)?.intValue == 1
         // Shift inverts the setting, exactly like macOS; no sound while muted.
         guard enabled != shiftHeld, !AudioDevices.isMuted(), soundID != 0 else { return }
+        // Key repeat is ~30 ms apart; keep a small gap so held keys tick steadily instead of stuttering.
+        guard Date().timeIntervalSince(lastPlayed) > 0.07 else { return }
+        lastPlayed = Date()
         AudioServicesPlaySystemSound(soundID)
     }
 }
