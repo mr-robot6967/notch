@@ -437,9 +437,22 @@ final class SpotifyClient: ObservableObject {
 
     /// Saves or removes the current song from Liked Songs.
     func toggleLike() async {
-        await refreshTrackState() // always act on the song that's playing now
-        guard let id = currentTrackID else { status = "Couldn't find the current song on Spotify"; return }
-        let saving = !isLiked
+        // Flip the heart at once (the API call takes a moment); revert below if Spotify refuses.
+        let previous = isLiked
+        let saving = !previous
+        isLiked = saving
+        // Only look the song up again if what we know belongs to another song.
+        let info = MediaController.shared.info
+        let key = info.map { "\($0.title)|\($0.artist)" } ?? ""
+        if currentTrackID == nil || key != likedKey {
+            await refreshTrackState()
+            isLiked = saving
+        }
+        guard let id = currentTrackID else {
+            isLiked = previous
+            status = "Couldn't find the current song on Spotify"
+            return
+        }
         // Unliking removes every ID the song is known by (it may be saved under the original).
         if !saving, currentTrackIDs.count > 1 {
             let uris = currentTrackIDs.map { "spotify:track:\($0)" }.joined(separator: ",")
@@ -467,6 +480,7 @@ final class SpotifyClient: ObservableObject {
             Task { await self.refreshLikedIndex(force: true) }
             status = saving ? "Saved to Liked Songs" : "Removed from Liked Songs"
         } else {
+            isLiked = previous
             status = "Spotify refused (code \(code))"
         }
     }

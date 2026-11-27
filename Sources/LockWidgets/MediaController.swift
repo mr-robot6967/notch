@@ -137,13 +137,97 @@ final class MediaController: ObservableObject {
 
     func next() { skipForwardCount += 1; command("next", script: "next track") }
     func previous() { skipBackCount += 1; command("previous", script: "previous track") }
+    // Spotify and Music don't report shuffle/repeat to the system Now Playing, and ignore its
+    // shuffle/repeat commands — so the buttons read "off" and did nothing. Both apps expose these
+    // through AppleScript, which is what we use for them (only while the app is already running).
+    // Modes use MediaRemote's numbering: shuffle 1 off / 2 on; repeat 1 off / 2 one / 3 all.
+    private var appModes: (bundle: String, shuffle: Int, repeat: Int)?
+
+    private static let scriptablePlayers: [String: String] = ["com.spotify.client": "Spotify", "com.apple.Music": "Music"]
+
+    private func scriptablePlayer() -> (bundle: String, app: String)? {
+        guard let bundle = info?.bundleIdentifier, let app = Self.scriptablePlayers[bundle],
+              !NSRunningApplication.runningApplications(withBundleIdentifier: bundle).isEmpty else { return nil }
+        return (bundle, app)
+    }
+
+    /// Reads the real shuffle/repeat state from Spotify/Music and shows it on the buttons.
+    func refreshAppModes() {
+        guard let player = scriptablePlayer() else { return }
+        let source = player.app == "Spotify"
+            ? "tell application \"Spotify\" to return {shuffling, repeating}"
+            : "tell application \"Music\" to return {shuffle enabled, (song repeat as string)}"
+        appleScriptQueue.async {
+            var error: NSDictionary?
+            guard let result = NSAppleScript(source: source)?.executeAndReturnError(&error), error == nil,
+                  result.numberOfItems >= 2,
+                  let first = result.atIndex(1), let second = result.atIndex(2) else { return }
+            let shuffle = first.booleanValue ? 2 : 1
+            let repeatMode: Int
+            if player.app == "Spotify" {
+                repeatMode = second.booleanValue ? 3 : 1
+            } else {
+                switch second.stringValue ?? "off" { case "one": repeatMode = 2; case "all": repeatMode = 3; default: repeatMode = 1 }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let media = MediaController.shared
+                    media.appModes = (player.bundle, shuffle, repeatMode)
+                    if var current = media.info, current.bundleIdentifier == player.bundle {
+                        current.shuffleMode = shuffle
+                        current.repeatMode = repeatMode
+                        media.info = current
+                    }
+                }
+            }
+        }
+    }
+
+    private func runPlayerScript(_ source: String) {
+        appleScriptQueue.async {
+            var error: NSDictionary?
+            _ = NSAppleScript(source: source)?.executeAndReturnError(&error)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                MainActor.assumeIsolated { MediaController.shared.refreshAppModes() }
+            }
+        }
+    }
+
     func toggleShuffle() {
+        if let player = scriptablePlayer() {
+            if var current = info { current.shuffleMode = current.shuffleOn ? 1 : 2; info = current }
+            runPlayerScript(player.app == "Spotify"
+                ? "tell application \"Spotify\" to set shuffling to not shuffling"
+                : "tell application \"Music\" to set shuffle enabled to not shuffle enabled")
+            return
+        }
         guard usingHelper else { return }
         send("shuffle")
         if var current = info { current.shuffleMode = current.shuffleOn ? 1 : 2; info = current }
     }
 
     func toggleRepeat() {
+        if let player = scriptablePlayer() {
+            if player.app == "Spotify" {
+                if var current = info { current.repeatMode = current.repeatOn ? 1 : 3; info = current }
+                runPlayerScript("tell application \"Spotify\" to set repeating to not repeating")
+            } else {
+                // Music cycles Off → All → One → Off, like its own button.
+                if var current = info { current.repeatMode = current.repeatMode == 3 ? 2 : (current.repeatMode == 2 ? 1 : 3); info = current }
+                runPlayerScript("""
+                tell application "Music"
+                    if song repeat is off then
+                        set song repeat to all
+                    else if song repeat is all then
+                        set song repeat to one
+                    else
+                        set song repeat to off
+                    end if
+                end tell
+                """)
+            }
+            return
+        }
         guard usingHelper else { return }
         send("repeat")
         if var current = info { current.repeatMode = current.repeatOn ? 1 : 3; info = current }
@@ -333,7 +417,7 @@ final class MediaController: ObservableObject {
         }
         clearWork?.cancel()
         let timestamp = (o["timestamp"] as? Double).map { Date(timeIntervalSince1970: $0) } ?? Date()
-        let new = NowPlayingInfo(
+        var new = NowPlayingInfo(
             title: o["title"] as? String ?? "",
             artist: o["artist"] as? String ?? "",
             album: o["album"] as? String ?? "",
@@ -347,6 +431,12 @@ final class MediaController: ObservableObject {
             shuffleMode: o["shuffle"] as? Int ?? 0,
             repeatMode: o["repeat"] as? Int ?? 0
         )
+        // The player didn't report shuffle/repeat (Spotify, Music): keep what AppleScript told us.
+        if o["shuffle"] == nil, let modes = appModes, modes.bundle == new.bundleIdentifier {
+            new.shuffleMode = modes.shuffle
+            new.repeatMode = modes.repeat
+        }
+        let songChanged = new.title != info?.title || new.bundleIdentifier != info?.bundleIdentifier
         if new.title != info?.title || new.album != info?.album, o["artwork"] == nil, o["artworkCleared"] == nil {
             // New track; keep the old art until the new one arrives (it can lag a little).
         }
@@ -354,6 +444,11 @@ final class MediaController: ObservableObject {
         if let old = info, old.title != new.title, new.isPlaying, !new.title.isEmpty,
            AppSettings.shared.config.songChangePeek, !NotchModel.shared.expanded {
             NotchModel.shared.flash(.songChange(title: new.displayTitle, artist: new.artist), seconds: 2.0)
+        }
+        if songChanged, Self.scriptablePlayers[new.bundleIdentifier ?? ""] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                MainActor.assumeIsolated { MediaController.shared.refreshAppModes() }
+            }
         }
         // Starting/stopping changes the island's shape, so animate those changes.
         if info == nil || info?.isPlaying != new.isPlaying {
