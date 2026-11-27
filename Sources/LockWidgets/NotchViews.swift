@@ -483,6 +483,7 @@ private struct NowPlayingPage: View {
     @ObservedObject private var media = MediaController.shared
     @ObservedObject private var audio = AudioDevices.shared
     @ObservedObject private var spotify = SpotifyClient.shared
+    @ObservedObject private var ytMusic = YTMusicBridge.shared
     @EnvironmentObject private var settings: AppSettings
 
     var body: some View {
@@ -621,16 +622,17 @@ private struct NowPlayingPage: View {
     @ViewBuilder private func leftControl(_ info: NowPlayingInfo) -> some View {
         let choice = settings.config.notchLeftControl
         if choice == "like" {
-            let liked = info.bundleIdentifier == "com.spotify.client" && spotify.isLiked
-            control(liked ? "heart.fill" : "heart", 16, dim: !liked, tint: liked ? .green : nil) {
+            let youtube = YTMusicBridge.browser(for: info.bundleIdentifier) != nil
+            let liked = (info.bundleIdentifier == "com.spotify.client" && spotify.isLiked) || (youtube && ytMusic.liked)
+            control(liked ? "heart.fill" : "heart", 16, dim: !liked, tint: liked ? (youtube ? .red : .green) : nil) {
                 if info.canLike {
                     media.like()
                 } else {
-                    // Spotify needs the optional connection for Like — take the user there.
-                    AppActions.shared.openSettingsPage("integrations")
+                    // Spotify needs the optional connection; YouTube Music needs the browser setting.
+                    if youtube { YTMusicBridge.shared.refresh() } else { AppActions.shared.openSettingsPage("integrations") }
                 }
             }
-            .help(info.canLike ? "Like" : "Connect Spotify in Settings › Integrations to like songs")
+            .help(info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Integrations to like songs"))
         } else if choice == "repeat" {
             control(info.repeatMode == 2 ? "repeat.1" : "repeat", 16, dim: !info.repeatOn, tint: info.repeatOn ? media.artworkColor : nil) { media.toggleRepeat() }
         } else if choice == "none" {

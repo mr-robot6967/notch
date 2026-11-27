@@ -26,6 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         signal(SIGPIPE, SIG_IGN) // a closed pipe/socket must never kill the app
+        if CommandLine.arguments.contains("--spotify-modes-test") {
+            Task { @MainActor in
+                await SpotifyClient.shared.modesTest()
+                NSApp.terminate(nil)
+            }
+            return
+        }
         if CommandLine.arguments.contains("--spotify-selftest") {
             Task { @MainActor in
                 await SpotifyClient.shared.selfTest()

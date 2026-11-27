@@ -168,7 +168,7 @@ struct WidgetStripView: View {
             }
         }
         .padding(16 * k)
-        .shadow(color: theme.floating ? theme.shadow : .clear, radius: 8 * k, y: 3 * k)
+        .shadow(color: theme.floating && !theme.glass ? theme.shadow : .clear, radius: 8 * k, y: 3 * k)
         .environment(\.uiScale, k)
         .environment(\.widgetTheme, theme)
     }
@@ -224,7 +224,7 @@ struct SingleWidgetView: View {
         let theme = WidgetTheme.resolve(settings: settings, store: store, screenKey: screenKey)
         WidgetView(entry: entry)
             .padding(10 * k)
-            .shadow(color: theme.floating ? theme.shadow : .clear, radius: 8 * k, y: 3 * k)
+            .shadow(color: theme.floating && !theme.glass ? theme.shadow : .clear, radius: 8 * k, y: 3 * k)
             .environment(\.uiScale, k)
             .environment(\.widgetTheme, theme)
     }
@@ -346,7 +346,7 @@ struct GlassBackground<S: Shape>: View {
                 // Soft shadow only outside the shape (cut out inside so the glass isn't darkened):
                 // lifts the circle off the wallpaper.
                 ZStack {
-                    shape.fill(Color.black).shadow(color: .black.opacity(0.38), radius: 12 * k, y: 6 * k)
+                    shape.fill(Color.black).shadow(color: .black.opacity(0.14), radius: 5 * k, y: 2 * k)
                     shape.fill(Color.black).blendMode(.destinationOut)
                 }
                 .compositingGroup()

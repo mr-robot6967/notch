@@ -435,6 +435,47 @@ final class SpotifyClient: ObservableObject {
         }
     }
 
+    // Shuffle/repeat: Spotify's AppleScript setter no longer works (it has three shuffle modes now),
+    // so with the connection we use the Web API, which sets and reports them reliably.
+
+    /// Current shuffle and repeat ("off", "context", "track"), or nil if Spotify couldn't be asked.
+    func playbackModes() async -> (shuffle: Bool, repeatState: String)? {
+        guard connected else { return nil }
+        let (code, data) = await api("GET", "/me/player")
+        guard code == 200, let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return (json["shuffle_state"] as? Bool ?? false, json["repeat_state"] as? String ?? "off")
+    }
+
+    @discardableResult
+    func setShuffle(_ on: Bool) async -> Bool {
+        guard connected else { return false }
+        let (code, _) = await api("PUT", "/me/player/shuffle?state=\(on)")
+        return (200...299).contains(code)
+    }
+
+    /// state: "off", "context" (repeat all) or "track" (repeat one).
+    @discardableResult
+    func setRepeat(_ state: String) async -> Bool {
+        guard connected else { return false }
+        let (code, _) = await api("PUT", "/me/player/repeat?state=\(state)")
+        return (200...299).contains(code)
+    }
+
+    /// `--spotify-modes-test`: flips shuffle, reads it back, restores it (proves control works).
+    func modesTest() async {
+        guard Self.loadRefreshToken() != nil else { print("spotify: no token"); return }
+        connected = true
+        guard let before = await playbackModes() else { print("spotify: player state unavailable"); return }
+        print("spotify: before shuffle=\(before.shuffle) repeat=\(before.repeatState)")
+        let set1 = await setShuffle(!before.shuffle)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        let mid = await playbackModes()
+        print("spotify: set shuffle \(!before.shuffle) → \(set1 ? "ok" : "failed"), now shuffle=\(mid?.shuffle.description ?? "?")")
+        await setShuffle(before.shuffle)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        print("spotify: restored shuffle=\((await playbackModes())?.shuffle.description ?? "?")")
+    }
+
     /// Saves or removes the current song from Liked Songs.
     func toggleLike() async {
         // Flip the heart at once (the API call takes a moment); revert below if Spotify refuses.

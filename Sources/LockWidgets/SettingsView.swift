@@ -1567,6 +1567,13 @@ private struct NowPlayingSettingsPage: View {
                 Toggle("Click the song to open the app playing it", isOn: $settings.config.openSourceOnTap)
                 Toggle("Show the app's icon on the album art", isOn: $settings.config.showSourceBadge)
             }
+            if let hint = YTMusicBridge.shared.needsAppleEvents {
+                Section("YouTube Music") {
+                    Label(hint, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("This lets Notch press YouTube Music's own Like, Shuffle and Repeat buttons. Only the music.youtube.com tab is touched.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Section("Source") {
                 LabeledContent("Reading from") {
                     Text(media.usingHelper ? "Any app (system Now Playing)" : "Music & Spotify only")

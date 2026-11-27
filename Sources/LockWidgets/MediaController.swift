@@ -52,7 +52,9 @@ struct NowPlayingInfo: Equatable {
         switch bundleIdentifier {
         case "com.spotify.client": return SpotifyClient.shared.connected
         case "com.apple.Music", "com.apple.podcasts": return true
-        default: return false
+        default:
+            // YouTube Music in a browser: like through its own button (see YTMusicBridge).
+            return YTMusicBridge.browser(for: bundleIdentifier) != nil && YTMusicBridge.shared.active
         }
     }
 
@@ -154,6 +156,20 @@ final class MediaController: ObservableObject {
     /// Reads the real shuffle/repeat state from Spotify/Music and shows it on the buttons.
     func refreshAppModes() {
         guard let player = scriptablePlayer() else { return }
+        if player.app == "Spotify", SpotifyClient.shared.connected {
+            Task { @MainActor in
+                guard let modes = await SpotifyClient.shared.playbackModes() else { return }
+                let shuffle = modes.shuffle ? 2 : 1
+                let repeatMode = modes.repeatState == "track" ? 2 : (modes.repeatState == "context" ? 3 : 1)
+                self.appModes = (player.bundle, shuffle, repeatMode)
+                if var current = self.info, current.bundleIdentifier == player.bundle {
+                    current.shuffleMode = shuffle
+                    current.repeatMode = repeatMode
+                    self.info = current
+                }
+            }
+            return
+        }
         let source = player.app == "Spotify"
             ? "tell application \"Spotify\" to return {shuffling, repeating}"
             : "tell application \"Music\" to return {shuffle enabled, (song repeat as string)}"
@@ -193,7 +209,29 @@ final class MediaController: ObservableObject {
         }
     }
 
+    /// Repeat state read from the YouTube Music tab, shown on the button.
+    func applyYouTubeModes(repeatMode: Int) {
+        guard var current = info, YTMusicBridge.browser(for: current.bundleIdentifier) != nil else { return }
+        current.repeatMode = repeatMode
+        info = current
+    }
+
+    private var isYouTubeMusic: Bool {
+        YTMusicBridge.browser(for: info?.bundleIdentifier) != nil && YTMusicBridge.shared.active
+    }
+
     func toggleShuffle() {
+        if isYouTubeMusic { YTMusicBridge.shared.shuffle(); return }
+        if let player = scriptablePlayer(), player.app == "Spotify", SpotifyClient.shared.connected {
+            let turnOn = !(info?.shuffleOn ?? false)
+            if var current = info { current.shuffleMode = turnOn ? 2 : 1; info = current }
+            Task { @MainActor in
+                await SpotifyClient.shared.setShuffle(turnOn)
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                self.refreshAppModes()
+            }
+            return
+        }
         if let player = scriptablePlayer() {
             if var current = info { current.shuffleMode = current.shuffleOn ? 1 : 2; info = current }
             runPlayerScript(player.app == "Spotify"
@@ -207,6 +245,19 @@ final class MediaController: ObservableObject {
     }
 
     func toggleRepeat() {
+        if isYouTubeMusic { YTMusicBridge.shared.cycleRepeat(); return }
+        if let player = scriptablePlayer(), player.app == "Spotify", SpotifyClient.shared.connected {
+            // Spotify cycles Off → All (context) → One (track) → Off.
+            let mode = info?.repeatMode ?? 1
+            let next = mode == 1 ? 3 : (mode == 3 ? 2 : 1)
+            if var current = info { current.repeatMode = next; info = current }
+            Task { @MainActor in
+                await SpotifyClient.shared.setRepeat(next == 3 ? "context" : (next == 2 ? "track" : "off"))
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                self.refreshAppModes()
+            }
+            return
+        }
         if let player = scriptablePlayer() {
             if player.app == "Spotify" {
                 if var current = info { current.repeatMode = current.repeatOn ? 1 : 3; info = current }
@@ -237,6 +288,8 @@ final class MediaController: ObservableObject {
     func like() {
         if info?.bundleIdentifier == "com.spotify.client", SpotifyClient.shared.connected {
             Task { await SpotifyClient.shared.toggleLike() }
+        } else if isYouTubeMusic {
+            YTMusicBridge.shared.toggleLike()
         } else if usingHelper {
             send("like")
         }
@@ -444,6 +497,11 @@ final class MediaController: ObservableObject {
         if let old = info, old.title != new.title, new.isPlaying, !new.title.isEmpty,
            AppSettings.shared.config.songChangePeek, !NotchModel.shared.expanded {
             NotchModel.shared.flash(.songChange(title: new.displayTitle, artist: new.artist), seconds: 2.0)
+        }
+        if songChanged, YTMusicBridge.browser(for: new.bundleIdentifier) != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                MainActor.assumeIsolated { YTMusicBridge.shared.refresh() }
+            }
         }
         if songChanged, Self.scriptablePlayers[new.bundleIdentifier ?? ""] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

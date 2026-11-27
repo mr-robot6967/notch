@@ -905,6 +905,7 @@ final class NotchController {
               !hiddenForFullscreen else { return }
         if !model.availablePages.contains(model.page) { model.page = model.availablePages[0] }
         withAnimation(IslandMotion.open) { model.expanded = true }
+        if YTMusicBridge.browser(for: MediaController.shared.info?.bundleIdentifier) != nil { YTMusicBridge.shared.refresh() }
         if settings.config.notchHaptics { NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now) }
     }
 
