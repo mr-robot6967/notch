@@ -34,6 +34,7 @@ let package = Package(
                 .linkedFramework("ServiceManagement"),
                 .linkedFramework("EventKit"),
                 .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox"),
                 .linkedFramework("IOBluetooth")
             ]
         ),

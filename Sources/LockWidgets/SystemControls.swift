@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Combine
 import CoreAudio
+import AudioToolbox
 import OSLog
 
 private let controlsLog = Logger(subsystem: "com.k2a.LockWidgets", category: "controls")
@@ -485,9 +486,15 @@ final class MediaKeyTap {
         // Same for mute: without a settable mute property the key was swallowed and did nothing.
         if code == 7 && !MainActor.assumeIsolated({ AudioDevices.canSetMute() }) { return false }
         if [2, 3].contains(code) && (disabled.contains("brightness") || Brightness.get() == nil) { return false }
-        guard isDown else { return true } // swallow key-up too
+        guard isDown else {
+            // macOS plays its volume feedback once, when the key is released.
+            if code == 0 || code == 1 {
+                let shiftUp = ns.modifierFlags.contains(.shift)
+                DispatchQueue.main.async { MainActor.assumeIsolated { VolumeFeedback.play(shiftHeld: shiftUp) } }
+            }
+            return true // swallow key-up too
+        }
         let fine = ns.modifierFlags.contains(.option) && ns.modifierFlags.contains(.shift)
-        let shift = ns.modifierFlags.contains(.shift)
         let step: Float = fine ? 1.0 / 64.0 : 1.0 / 16.0
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
@@ -496,7 +503,6 @@ final class MediaKeyTap {
                     MediaKeyTap.lastVolumeKeyAt = Date()
                     let v = min(1, max(0, AudioDevices.volume() + (code == 0 ? step : -step)))
                     AudioDevices.setVolume((v * 64).rounded() / 64)
-                    VolumeFeedback.play(shiftHeld: shift)
                     // At 0 % / 100 % CoreAudio reports no change, so show the level (and limit haptic) here.
                     if v <= 0 || v >= 1 {
                         NotchModel.shared.flash(.volume(level: v, muted: AudioDevices.isMuted()), seconds: 1.6)
@@ -525,23 +531,22 @@ final class MediaKeyTap {
 /// system's own sound, whenever that setting is on (Shift inverts it, exactly like macOS).
 @MainActor
 enum VolumeFeedback {
-    /// macOS's own volume-change feedback sound (the "pop" you hear when changing the volume) —
-    /// not the alert sound. Played at full sound volume, so its loudness follows the output volume
-    /// that was just set, exactly like macOS.
-    private static let sound: NSSound? = NSSound(contentsOfFile:
-        "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff", byReference: true)
-    private static var lastPlayed = Date.distantPast
+    /// macOS's own volume-change feedback ("pop"), played the way macOS plays it: as a *system
+    /// sound* through the system sound service (same output, level and processing as other interface
+    /// sounds), once on key release. NSSound played it like a regular audio file, which sounded
+    /// different from the real thing.
+    private static var soundID: SystemSoundID = {
+        var id: SystemSoundID = 0
+        let url = URL(fileURLWithPath: "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff")
+        AudioServicesCreateSystemSoundID(url as CFURL, &id)
+        return id
+    }()
 
     static func play(shiftHeld: Bool) {
         let global = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain) ?? [:]
         let enabled = (global["com.apple.sound.beep.feedback"] as? NSNumber)?.intValue == 1
         // Shift inverts the setting, exactly like macOS; no sound while muted.
-        guard enabled != shiftHeld, !AudioDevices.isMuted(), let sound else { return }
-        // Holding the key repeats fast; one sound per ~120 ms, like macOS.
-        guard Date().timeIntervalSince(lastPlayed) > 0.12 else { return }
-        lastPlayed = Date()
-        sound.stop()
-        sound.volume = 1
-        sound.play()
+        guard enabled != shiftHeld, !AudioDevices.isMuted(), soundID != 0 else { return }
+        AudioServicesPlaySystemSound(soundID)
     }
 }
