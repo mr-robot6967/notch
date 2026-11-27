@@ -219,6 +219,9 @@ struct Config: Codable, Equatable {
     var discordClientID: String = ""
     var discordShowArt: Bool = false
     var spotifyClientID: String = ""
+    /// Also count songs liked from another release (reads the whole Liked Songs list once a day —
+    /// many requests, so off by default).
+    var spotifyMatchReleases: Bool = false
 
     // Sounds
     var lockSounds: Bool = true

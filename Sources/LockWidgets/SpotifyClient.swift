@@ -50,6 +50,9 @@ final class SpotifyClient: ObservableObject {
     /// original it was relinked from (Liked Songs may hold either).
     private var currentTrackIDs: [String] = []
     private var likeTimer: Timer?
+    /// Liked state per track ID with when it was checked (one API call per song, not per minute).
+    private var likedCache: [String: (liked: Bool, at: Date)] = [:]
+    private var lastIslandCheck = Date.distantPast
     /// Liked Songs indexed by recording (ISRC) and by title + artist → saved track ID, so a song
     /// liked from another release (single vs album) shows as liked, like the Spotify app does.
     private var likedByISRC: [String: String] = [:]
@@ -198,7 +201,10 @@ final class SpotifyClient: ObservableObject {
             .removeDuplicates()
             .filter { $0 }
             .sink { [weak self] _ in
-                guard let self, self.connected, MediaController.shared.info?.bundleIdentifier == "com.spotify.client" else { return }
+                guard let self, self.connected, MediaController.shared.info?.bundleIdentifier == "com.spotify.client",
+                      Date().timeIntervalSince(self.lastIslandCheck) > 60 else { return }
+                self.lastIslandCheck = Date()
+                self.likedCache[self.currentTrackID ?? ""] = nil // opening the island asks for a fresh answer
                 Task { await self.refreshTrackState() }
             }
             .store(in: &cancellables)
@@ -376,11 +382,25 @@ final class SpotifyClient: ObservableObject {
     /// Spotify rate-limits this app's key (development-mode apps get a small quota). After a 429 we
     /// stop calling until the time it asks for; hammering it kept the quota exhausted, so every
     /// like check failed and the heart showed "not liked".
-    private var blockedUntil = Date.distantPast
+    private var blockedUntil = Date.distantPast { didSet { busyUntil = blockedUntil > Date() ? blockedUntil : nil } }
+    /// Set while Spotify calls are paused (rate limit or our own budget) — shown on the heart.
+    @Published private(set) var busyUntil: Date?
+    /// Our own ceiling, well under what one key allows, so a single user can never exhaust it.
+    private static let hourlyBudget = 150
+    private var recentRequests: [Date] = []
 
     @discardableResult
     private func api(_ method: String, _ path: String, json: Any? = nil, retried: Bool = false) async -> (Int, Data?) {
         if Date() < blockedUntil { return (429, nil) }
+        if busyUntil != nil { busyUntil = nil } // the pause is over
+        let now = Date()
+        recentRequests.removeAll { now.timeIntervalSince($0) > 3600 }
+        if recentRequests.count >= Self.hourlyBudget, let oldest = recentRequests.first {
+            blockedUntil = oldest.addingTimeInterval(3600)
+            status = "Notch paused Spotify requests for a few minutes (hourly limit)"
+            return (429, nil)
+        }
+        recentRequests.append(now)
         if accessToken == nil || Date() > tokenExpiry {
             guard await refreshAccessToken() else { return (401, nil) }
         }
@@ -436,10 +456,17 @@ final class SpotifyClient: ObservableObject {
         if let linked = (item["linked_from"] as? [String: Any])?["id"] as? String, linked != id { ids.append(linked) }
         currentTrackID = id
         currentTrackIDs = ids
-        await refreshLikedIndex()
         let (key, isrc) = Self.keyAndISRC(item)
         currentIndexKeys = (key, isrc)
-        let other = isrc.flatMap { likedByISRC[$0] } ?? likedByKey[key]
+        // One check per song: reuse a recent answer for the same track instead of asking again.
+        if let cached = likedCache[id], Date().timeIntervalSince(cached.at) < 600 {
+            isLiked = cached.liked
+            if let info = MediaController.shared.info { likedKey = "\(info.title)|\(info.artist)" }
+            return true
+        }
+        let matchReleases = AppSettings.shared.config.spotifyMatchReleases
+        if matchReleases { await refreshLikedIndex() }
+        let other = matchReleases ? (isrc.flatMap { likedByISRC[$0] } ?? likedByKey[key]) : nil
         if let exact = await libraryContains(ids) {
             matchedSavedID = exact ? nil : other
             isLiked = exact || other != nil
@@ -450,6 +477,7 @@ final class SpotifyClient: ObservableObject {
             return false
         }
         if let info = MediaController.shared.info { likedKey = "\(info.title)|\(info.artist)" }
+        likedCache[id] = (isLiked, Date())
         return true
     }
 
@@ -465,6 +493,14 @@ final class SpotifyClient: ObservableObject {
 
     /// While Spotify plays, re-check every 20 s so a ♥ added or removed in Spotify itself shows here.
     private func updateLikeTimer() {
+        // No background polling any more: song changes, opening the island (throttled) and wake
+        // re-check. Keeps each user far below Spotify's per-key limits.
+        likeTimer?.invalidate()
+        likeTimer = nil
+        return
+    }
+
+    private func legacyLikeTimer() {
         let spotifyPlaying = connected && MediaController.shared.info?.bundleIdentifier == "com.spotify.client"
             && MediaController.shared.info?.isPlaying == true
         if spotifyPlaying, likeTimer == nil {
@@ -570,6 +606,7 @@ final class SpotifyClient: ObservableObject {
         }
         if (200...299).contains(code) {
             isLiked = saving
+            likedCache[id] = (saving, Date())
             if let keys = currentIndexKeys {
                 if saving {
                     likedByKey[keys.key] = id

@@ -632,7 +632,7 @@ private struct NowPlayingPage: View {
                     if youtube { YTMusicBridge.shared.refresh() } else { AppActions.shared.openSettingsPage("integrations") }
                 }
             }
-            .help(info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Integrations to like songs"))
+            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Integrations to like songs"))
         } else if choice == "repeat" {
             control(info.repeatMode == 2 ? "repeat.1" : "repeat", 16, dim: !info.repeatOn, tint: info.repeatOn ? media.artworkColor : nil) { media.toggleRepeat() }
         } else if choice == "none" {

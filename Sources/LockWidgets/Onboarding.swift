@@ -55,6 +55,7 @@ private final class KeyableWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
+@MainActor
 private final class OnboardingState: ObservableObject {
     /// 0 = the notch, 1 = swelling, 2 = dripped into a tall pill, 3 = the full panel.
     @Published var phase = 0
@@ -64,6 +65,9 @@ private final class OnboardingState: ObservableObject {
     /// Fades the island out once it is back at the notch's exact size (invisible over the real notch).
     @Published var islandOpacity: Double = 1
     @Published var step = 0
+    /// Set up Spotify likes & devices (adds the Spotify step).
+    @Published var wantsSpotify = !AppSettings.shared.config.spotifyClientID.isEmpty
+    @Published var spotifyDraft = AppSettings.shared.config.spotifyClientID
     @Published var greeting = 0
     @Published var reveal: CGFloat = 0
     @Published var showWelcome = false
@@ -178,6 +182,7 @@ private struct OnboardingView: View {
             case 0: hello.transition(.opacity.combined(with: .scale(scale: 0.96)))
             case 1: features.transition(.push(from: .trailing))
             case 2: permissions.transition(.push(from: .trailing))
+            case 3: spotifyStep.transition(.push(from: .trailing))
             default: done.transition(.push(from: .trailing))
             }
         }
@@ -259,7 +264,9 @@ private struct OnboardingView: View {
                 FeatureRow(symbol: "calendar", color: .orange, title: "Calendar",
                            detail: "A heads-up before your next event", isOn: $settings.config.calendarPeek)
                 FeatureRow(symbol: "square.grid.2x2.fill", color: .teal, title: "Desktop Widgets",
-                           detail: "Widgets on your desktop", isOn: $settings.config.desktopWidgetsEnabled, last: true)
+                           detail: "Widgets on your desktop", isOn: $settings.config.desktopWidgetsEnabled)
+                FeatureRow(symbol: "heart.fill", color: .green, title: "Spotify Likes & Devices",
+                           detail: "Like songs and switch speakers (free, 2-minute setup)", isOn: $state.wantsSpotify, last: true)
             }
         }
     }
@@ -270,7 +277,7 @@ private struct OnboardingView: View {
         let rows = permissionRows(settings.config)
         return StepLayout(symbol: "hand.raised.fill", title: "Permissions",
                           subtitle: "Only what your features need. Nothing leaves your Mac.",
-                          back: { state.step = 1 }, next: { state.step = 3 }) {
+                          back: { state.step = 1 }, next: { state.step = state.wantsSpotify ? 3 : 4 }) {
             if rows.isEmpty {
                 Text("Nothing to allow for the features you chose.")
                     .font(.system(size: 13)).foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(.top, 20)
@@ -323,6 +330,17 @@ private struct OnboardingView: View {
             })
         }
         return rows
+    }
+
+    // MARK: Spotify
+
+    /// Each person uses their own free Spotify app, so nobody shares (or exhausts) anyone's limits.
+    private var spotifyStep: some View {
+        StepLayout(symbol: "heart.fill", title: "Connect Spotify",
+                   subtitle: "Uses your own free Spotify app, so it never runs into anyone else's limits.",
+                   back: { state.step = 2 }, next: { state.step = 4 }) {
+            SpotifySetupCard(draft: $state.spotifyDraft)
+        }
     }
 
     // MARK: Done
@@ -479,6 +497,70 @@ private struct TipRow: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
             if !last { RowDivider() }
+        }
+    }
+}
+
+/// Spotify setup: open the dashboard, add the Redirect URI, paste the Client ID, connect.
+private struct SpotifySetupCard: View {
+    @Binding var draft: String
+    @EnvironmentObject private var settings: AppSettings
+    @ObservedObject private var spotify = SpotifyClient.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            GroupedList {
+                SetupRow(number: 1, title: "Create a free app at the Spotify Dashboard", last: false) {
+                    Button("Open") { NSWorkspace.shared.open(URL(string: "https://developer.spotify.com/dashboard")!) }
+                        .controlSize(.small)
+                }
+                SetupRow(number: 2, title: "Add this Redirect URI and tick Web API", last: false) {
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(SpotifyClient.redirectURI, forType: .string)
+                    }
+                    .controlSize(.small)
+                }
+                Text(SpotifyClient.redirectURI)
+                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.leading, 52).padding(.bottom, 8)
+                SetupRow(number: 3, title: "Paste the app's Client ID", last: true) { EmptyView() }
+                HStack {
+                    TextField("Client ID", text: $draft).textFieldStyle(.roundedBorder).controlSize(.small)
+                    Button(spotify.connected ? "Connected" : "Connect") {
+                        settings.config.spotifyClientID = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        spotify.connect()
+                    }
+                    .controlSize(.small)
+                    .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty || spotify.connected)
+                }
+                .padding(.horizontal, 12).padding(.bottom, 10)
+            }
+            Text(spotify.connected ? "Spotify is connected. Likes and devices are ready." : spotify.status)
+                .font(.system(size: 11)).foregroundStyle(spotify.connected ? .green : .secondary)
+                .padding(.top, 8)
+        }
+    }
+}
+
+private struct SetupRow<Accessory: View>: View {
+    let number: Int
+    let title: String
+    let last: Bool
+    @ViewBuilder var accessory: Accessory
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("\(number)").font(.system(size: 12, weight: .bold)).foregroundStyle(.black)
+                    .frame(width: 22, height: 22).background(Circle().fill(.white))
+                    .frame(width: 28)
+                Text(title).font(.system(size: 13))
+                Spacer(minLength: 8)
+                accessory
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
         }
     }
 }

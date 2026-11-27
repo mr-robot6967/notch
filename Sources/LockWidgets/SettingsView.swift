@@ -1341,11 +1341,12 @@ private struct IntegrationsTab: View {
                         NSWorkspace.shared.open(URL(string: "https://developer.spotify.com/dashboard")!)
                     }
                 }
-                LabeledContent("Status", value: spotify.status)
+                LabeledContent("Status", value: spotify.busyUntil != nil ? "Busy — likes paused for a few minutes" : spotify.status)
+                Toggle("Match likes saved from other releases", isOn: $settings.config.spotifyMatchReleases)
             } header: {
                 Text("Spotify (optional extras)")
             } footer: {
-                Text("Optional. Adds Like and switching devices.")
+                Text("Uses your own free Spotify app, so your limits are yours alone: 1. Open Spotify Dashboard and create an app. 2. Add the Redirect URI above and tick Web API. 3. Paste its Client ID here, Save, then Connect. Matching other releases reads your whole Liked Songs list once a day, so leave it off unless you need it.")
             }
         }
         .formStyle(.grouped)
