@@ -81,7 +81,9 @@ final class Updater: ObservableObject {
             self.latestVersion = version
             self.releaseNotes = json["body"] as? String ?? ""
             self.expectedSHA = Self.sha256(in: self.releaseNotes)
-            self.dmgURL = (dmg?["browser_download_url"] as? String).flatMap(URL.init(string:))
+            // Only this repo's own release downloads are accepted.
+            let link = dmg?["browser_download_url"] as? String ?? ""
+            self.dmgURL = link.hasPrefix("https://github.com/\(Self.repo)/releases/download/") ? URL(string: link) : nil
             if Self.isNewer(version, than: self.currentVersion), self.dmgURL != nil {
                 self.state = .available(version: version)
             } else {
@@ -107,12 +109,36 @@ final class Updater: ObservableObject {
         return match.range(of: #"[0-9a-fA-F]{64}"#, options: .regularExpression).map { String(match[$0]).lowercased() }
     }
 
+    /// Why Notch can't replace itself where it is, or nil when it can.
+    nonisolated static func installBlocker(for path: String) -> String? {
+        if path.contains("/AppTranslocation/") || path.hasPrefix("/Volumes/") {
+            return "Move Notch to your Applications folder first, then update."
+        }
+        let folder = (path as NSString).deletingLastPathComponent
+        if !FileManager.default.isWritableFile(atPath: folder) || !FileManager.default.isWritableFile(atPath: path) {
+            return "Notch can't update itself here (no permission). Download the new version from GitHub instead."
+        }
+        return nil
+    }
+
+    var releasePage: URL { URL(string: "https://github.com/\(Self.repo)/releases/latest")! }
+
     func install() {
         guard case .available = state, let dmgURL else { return }
+        if let blocker = Self.installBlocker(for: Bundle.main.bundleURL.path) {
+            state = .failed(blocker)
+            return
+        }
+        guard let requirement = Self.pinnedRequirement(of: Bundle.main.bundleURL.path) else {
+            state = .failed("This copy of Notch isn't signed with a certificate, so it can't verify updates. Download the new version from GitHub instead.")
+            return
+        }
         state = .downloading
         let expected = expectedSHA
         let bundleID = Bundle.main.bundleIdentifier ?? ""
         let installedPath = Bundle.main.bundleURL.path
+        let tag = latestVersion ?? ""
+        let current = currentVersion
         Task.detached(priority: .userInitiated) {
             do {
                 let (temp, response) = try await URLSession.shared.download(from: dmgURL)
@@ -122,11 +148,11 @@ final class Updater: ObservableObject {
                 let dmg = work.appendingPathComponent("Notch.dmg")
                 try FileManager.default.moveItem(at: temp, to: dmg)
                 if let expected {
-                    let digest = SHA256.hash(data: try Data(contentsOf: dmg)).map { String(format: "%02x", $0) }.joined()
-                    guard digest == expected else { throw UpdateError.message("The download didn't match its checksum.") }
+                    guard try Self.fileSHA256(dmg) == expected else { throw UpdateError.message("The download didn't match its checksum.") }
                 }
                 await MainActor.run { Updater.shared.state = .installing }
-                let staged = try Self.stage(dmg: dmg, into: work, bundleID: bundleID)
+                let staged = try Self.stage(dmg: dmg, into: work, bundleID: bundleID, requirement: requirement,
+                                            tag: tag, current: current)
                 try Self.scheduleSwap(newApp: staged, installedPath: installedPath, work: work)
                 await MainActor.run { NSApp.terminate(nil) }
             } catch {
@@ -140,37 +166,90 @@ final class Updater: ObservableObject {
     enum UpdateError: Error { case message(String) }
 
     /// Mounts the DMG read-only, copies Notch.app out, detaches, and checks the copy.
-    nonisolated private static func stage(dmg: URL, into work: URL, bundleID: String) throws -> URL {
+    /// The running app's designated requirement when it pins a certificate (e.g. `identifier "…" and
+    /// certificate leaf = H"…"`). Ad-hoc builds pin only their own cdhash, which every new build
+    /// changes, so they can't verify an update — nil then.
+    nonisolated static func pinnedRequirement(of path: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["-d", "-r-", path]
+        let pipe = Pipe()
+        process.standardError = pipe
+        process.standardOutput = pipe
+        do { try process.run() } catch { return nil }
+        process.waitUntilExit()
+        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard let line = text.split(separator: "\n").first(where: { $0.contains("designated =>") }) else { return nil }
+        let requirement = line.components(separatedBy: "designated =>").last?.trimmingCharacters(in: .whitespaces) ?? ""
+        return requirement.contains("certificate leaf") ? requirement : nil
+    }
+
+    /// SHA-256 of a file, read in chunks (no need to hold the whole DMG in memory).
+    nonisolated static func fileSHA256(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Mounts the DMG read-only, copies Notch.app out, detaches, and checks the copy: it must be a real
+    /// Notch.app folder (not a symlink), signed by the same certificate as this Notch, intact, and the
+    /// version the release says — newer than what's installed.
+    nonisolated private static func stage(dmg: URL, into work: URL, bundleID: String, requirement: String,
+                                          tag: String, current: String) throws -> URL {
         let mount = work.appendingPathComponent("mnt")
         try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
-        guard run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-noverify", "-mountpoint", mount.path]) == 0 else {
+        guard run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount.path]) == 0 else {
             throw UpdateError.message("Couldn't open the downloaded update.")
         }
         defer { _ = run("/usr/bin/hdiutil", ["detach", mount.path, "-force"]) }
-        guard let app = try FileManager.default.contentsOfDirectory(at: mount, includingPropertiesForKeys: nil)
-            .first(where: { $0.pathExtension == "app" }) else { throw UpdateError.message("No app found in the update.") }
-        let staged = work.appendingPathComponent(app.lastPathComponent)
+        let app = mount.appendingPathComponent("Notch.app")
+        let values = try? app.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        guard values?.isDirectory == true, values?.isSymbolicLink == false else {
+            throw UpdateError.message("The update doesn't contain Notch — not installed.")
+        }
+        let staged = work.appendingPathComponent("Notch.app")
         guard run("/usr/bin/ditto", [app.path, staged.path]) == 0 else { throw UpdateError.message("Couldn't copy the update.") }
-        // Must be Notch (same identifier) with an intact code signature.
-        let newID = Bundle(url: staged)?.bundleIdentifier
-        guard newID == bundleID else { throw UpdateError.message("The update isn't Notch — not installed.") }
-        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", staged.path]) == 0 else {
-            throw UpdateError.message("The update's signature is invalid — not installed.")
+        let bundle = Bundle(url: staged)
+        guard bundle?.bundleIdentifier == bundleID else { throw UpdateError.message("The update isn't Notch — not installed.") }
+        // Same signer as this Notch (certificate pinned), and an intact signature.
+        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=" + requirement, staged.path]) == 0 else {
+            throw UpdateError.message("The update isn't signed by the same developer — not installed.")
+        }
+        // No downgrades or mismatches: the app inside must be the release's version, and newer.
+        let version = bundle?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        guard version == tag, isNewer(version, than: current) else {
+            throw UpdateError.message("The update's version doesn't match the release — not installed.")
         }
         return staged
     }
 
-    /// A tiny script waits for this process to quit, replaces the app, and opens the new one.
+    /// Single-quotes a path for /bin/sh (any character is safe inside, including spaces and $).
+    nonisolated private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// A tiny script waits for Notch to quit, then swaps the app safely: the new copy goes in next to
+    /// the old one first, the old one is moved aside, the new one takes its place, and only then is
+    /// the old one deleted. If any step fails the old app is put back — never left with no app.
     nonisolated private static func scheduleSwap(newApp: URL, installedPath: String, work: URL) throws {
         let pid = ProcessInfo.processInfo.processIdentifier
+        let tag = UUID().uuidString.prefix(8)
+        let app = shellQuote(installedPath)
+        let new = shellQuote(installedPath + ".new-\(tag)")
+        let old = shellQuote(installedPath + ".old-\(tag)")
+        let staged = shellQuote(newApp.path)
+        let workDir = shellQuote(work.path)
         let script = work.appendingPathComponent("swap.sh")
         let body = """
         #!/bin/sh
-        while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
-        rm -rf "\(installedPath)"
-        /usr/bin/ditto "\(newApp.path)" "\(installedPath)"
-        /usr/bin/open "\(installedPath)"
-        rm -rf "\(work.path)"
+        n=0; while kill -0 \(pid) 2>/dev/null && [ $n -lt 300 ]; do sleep 0.2; n=$((n+1)); done
+        if ! /usr/bin/ditto \(staged) \(new); then rm -rf \(new); /usr/bin/open \(app); exit 1; fi
+        if ! /bin/mv \(app) \(old); then rm -rf \(new); /usr/bin/open \(app); exit 1; fi
+        if /bin/mv \(new) \(app); then rm -rf \(old); else /bin/mv \(old) \(app); fi
+        /usr/bin/open \(app)
+        rm -rf \(workDir)
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
         let process = Process()

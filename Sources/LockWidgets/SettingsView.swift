@@ -1710,6 +1710,9 @@ private struct UpdatesSection: View {
                 Label("Notch is up to date", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                if updater.latestVersion != nil {
+                    Button("Open Release Page") { NSWorkspace.shared.open(updater.releasePage) }
+                }
             case .idle:
                 EmptyView()
             }
