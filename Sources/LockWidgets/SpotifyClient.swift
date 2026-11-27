@@ -124,18 +124,35 @@ final class SpotifyClient: ObservableObject {
         // Keep the heart in sync with the current Spotify track.
         MediaController.shared.$info
             .map { info -> String in info?.bundleIdentifier == "com.spotify.client" ? "\(info?.title ?? "")|\(info?.artist ?? "")" : "" }
+            // "Nothing playing" for a moment (waking from sleep, between tracks) isn't a new song:
+            // ignore it, so the same song coming back keeps its heart.
+            .filter { !$0.isEmpty }
             .removeDuplicates()
-            .handleEvents(receiveOutput: { _ in
-                // Forget the old track straight away so a quick ♥ can't hit it.
+            .handleEvents(receiveOutput: { key in
                 MainActor.assumeIsolated {
-                    SpotifyClient.shared.currentTrackID = nil
-                    SpotifyClient.shared.isLiked = false
+                    let client = SpotifyClient.shared
+                    guard key != client.likedKey else { return }
+                    // A different song: forget the old one straight away so a quick ♥ can't hit it.
+                    client.currentTrackID = nil
+                    client.isLiked = false
                 }
             })
             .debounce(for: .seconds(1.0), scheduler: RunLoop.main)
-            .sink { [weak self] key in
-                guard let self, self.connected, !key.isEmpty else { self?.isLiked = false; return }
+            .sink { [weak self] _ in
+                guard let self, self.connected else { return }
                 Task { await self.refreshTrackState() }
+            }
+            .store(in: &cancellables)
+        // After sleep the network comes back a few seconds late; re-check then (with retries).
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task {
+                    for delay in [4.0, 6.0, 10.0] {
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        if await self.refreshTrackState() { break }
+                    }
+                }
             }
             .store(in: &cancellables)
         MediaController.shared.$info
@@ -347,8 +364,14 @@ final class SpotifyClient: ObservableObject {
         return (code, data)
     }
 
-    func refreshTrackState() async {
-        guard connected else { return }
+    /// Song key ("title|artist") the current heart belongs to.
+    private(set) var likedKey = ""
+
+    /// Updates the heart for the playing song. Returns false if Spotify couldn't be reached — the
+    /// heart is then left as it was (a failed check must never look like "not liked").
+    @discardableResult
+    func refreshTrackState() async -> Bool {
+        guard connected else { return false }
         // Right after a skip Spotify can still report the previous song; retry briefly until it
         // matches what's on screen, so the heart is never taken from the wrong track.
         let expected = MediaController.shared.info?.title.lowercased() ?? ""
@@ -364,12 +387,7 @@ final class SpotifyClient: ObservableObject {
             }
             if attempt < 2 { try? await Task.sleep(nanoseconds: 1_200_000_000) }
         }
-        guard let item, let id = item["id"] as? String else {
-            currentTrackID = nil
-            currentTrackIDs = []
-            isLiked = false
-            return
-        }
+        guard let item, let id = item["id"] as? String else { return false }
         var ids = [id]
         if let linked = (item["linked_from"] as? [String: Any])?["id"] as? String, linked != id { ids.append(linked) }
         currentTrackID = id
@@ -383,7 +401,11 @@ final class SpotifyClient: ObservableObject {
         } else if let other {
             matchedSavedID = other
             isLiked = true
+        } else {
+            return false
         }
+        if let info = MediaController.shared.info { likedKey = "\(info.title)|\(info.artist)" }
+        return true
     }
 
     /// True if any of the IDs is in Liked Songs; nil if Spotify couldn't be asked.
