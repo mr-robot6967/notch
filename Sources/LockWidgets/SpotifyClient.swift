@@ -77,14 +77,18 @@ final class SpotifyClient: ObservableObject {
     }
 
     /// Reads Liked Songs (50 per page) into the index. Refreshed at most every 15 minutes.
+    /// When the whole Liked Songs list was last read (a full read is dozens of requests).
+    private var likedFullAt: Date?
+
     func refreshLikedIndex(force: Bool = false) async {
         guard connected, !indexing else { return }
-        if !force, let at = likedIndexAt, Date().timeIntervalSince(at) < 15 * 60 { return }
+        if likedIndexAt == nil { loadLikedCache() }
+        if !force, let at = likedIndexAt, Date().timeIntervalSince(at) < 30 * 60 { return }
         indexing = true
         defer { indexing = false }
-        // Full read the first time (and after a like/unlike); afterwards just the newest page, where
-        // new likes appear, merged into the index — one request instead of dozens.
-        let full = force || likedIndexAt == nil
+        // Full read at most once a day (or when asked); otherwise just the newest page, where new
+        // likes appear, merged into the saved index — one request instead of dozens.
+        let full = force || likedFullAt == nil || Date().timeIntervalSince(likedFullAt ?? .distantPast) > 24 * 3600
         var byISRC: [String: String] = full ? [:] : likedByISRC, byKey: [String: String] = full ? [:] : likedByKey
         var offset = 0
         while offset < (full ? 10_000 : 50) {
@@ -103,7 +107,36 @@ final class SpotifyClient: ObservableObject {
         likedByISRC = byISRC
         likedByKey = byKey
         likedIndexAt = Date()
+        if full { likedFullAt = Date() }
+        saveLikedCache()
     }
+
+    // The index is saved next to the sign-in file (owner-only) so a relaunch doesn't re-read it all.
+    nonisolated private static var likedCacheURL: URL {
+        tokenURL.deletingLastPathComponent().appendingPathComponent("spotify-liked.json")
+    }
+
+    private func saveLikedCache() {
+        let payload: [String: Any] = ["full": likedFullAt?.timeIntervalSince1970 ?? 0,
+                                      "at": likedIndexAt?.timeIntervalSince1970 ?? 0,
+                                      "isrc": likedByISRC, "key": likedByKey]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        let url = Self.likedCacheURL
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func loadLikedCache() {
+        guard let data = try? Data(contentsOf: Self.likedCacheURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        likedByISRC = json["isrc"] as? [String: String] ?? [:]
+        likedByKey = json["key"] as? [String: String] ?? [:]
+        if let full = json["full"] as? Double, full > 0 { likedFullAt = Date(timeIntervalSince1970: full) }
+        if let at = json["at"] as? Double, at > 0 { likedIndexAt = Date(timeIntervalSince1970: at) }
+    }
+
+    /// The playing song's index keys (to update the saved index locally after a like/unlike).
+    private var currentIndexKeys: (key: String, isrc: String?)?
     private var cancellables = Set<AnyCancellable>()
 
     func start() {
@@ -340,8 +373,14 @@ final class SpotifyClient: ObservableObject {
 
     // MARK: API
 
+    /// Spotify rate-limits this app's key (development-mode apps get a small quota). After a 429 we
+    /// stop calling until the time it asks for; hammering it kept the quota exhausted, so every
+    /// like check failed and the heart showed "not liked".
+    private var blockedUntil = Date.distantPast
+
     @discardableResult
     private func api(_ method: String, _ path: String, json: Any? = nil, retried: Bool = false) async -> (Int, Data?) {
+        if Date() < blockedUntil { return (429, nil) }
         if accessToken == nil || Date() > tokenExpiry {
             guard await refreshAccessToken() else { return (401, nil) }
         }
@@ -360,7 +399,12 @@ final class SpotifyClient: ObservableObject {
         let detail = code >= 400 ? (String(data: data.prefix(300), encoding: .utf8) ?? "") : ""
         spotifyLog.notice("Spotify: \(method, privacy: .public) \(path.components(separatedBy: "?").first ?? path, privacy: .public) → \(code) \(detail, privacy: .public)")
         if code == 401, !retried, await refreshAccessToken() { return await api(method, path, json: json, retried: true) }
-        if code == 429 { status = "Spotify rate limit — try again shortly" }
+        if code == 429 {
+            let retry = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 120
+            let wait = max(30, min(retry, 3600))
+            blockedUntil = Date().addingTimeInterval(wait)
+            status = "Spotify is busy — Notch will try again in \(Int((wait / 60).rounded(.up))) min"
+        }
         return (code, data)
     }
 
@@ -394,6 +438,7 @@ final class SpotifyClient: ObservableObject {
         currentTrackIDs = ids
         await refreshLikedIndex()
         let (key, isrc) = Self.keyAndISRC(item)
+        currentIndexKeys = (key, isrc)
         let other = isrc.flatMap { likedByISRC[$0] } ?? likedByKey[key]
         if let exact = await libraryContains(ids) {
             matchedSavedID = exact ? nil : other
@@ -423,10 +468,10 @@ final class SpotifyClient: ObservableObject {
         let spotifyPlaying = connected && MediaController.shared.info?.bundleIdentifier == "com.spotify.client"
             && MediaController.shared.info?.isPlaying == true
         if spotifyPlaying, likeTimer == nil {
-            let timer = Timer(timeInterval: 20, repeats: true) { _ in
+            let timer = Timer(timeInterval: 120, repeats: true) { _ in
                 MainActor.assumeIsolated { Task { await SpotifyClient.shared.refreshTrackState() } }
             }
-            timer.tolerance = 5
+            timer.tolerance = 20
             RunLoop.main.add(timer, forMode: .common)
             likeTimer = timer
         } else if !spotifyPlaying {
@@ -467,6 +512,14 @@ final class SpotifyClient: ObservableObject {
         connected = true
         guard let before = await playbackModes() else { print("spotify: player state unavailable"); return }
         print("spotify: before shuffle=\(before.shuffle) repeat=\(before.repeatState)")
+        let (sc, sd) = await api("PUT", "/me/player/shuffle?state=\(!before.shuffle)")
+        print("spotify: PUT shuffle → \(sc) \(sd.flatMap { String(data: $0, encoding: .utf8) }?.prefix(200) ?? "")")
+        let (lc, ld) = await api("GET", "/me/tracks?limit=1")
+        print("spotify: GET /me/tracks → \(lc) \(ld.flatMap { String(data: $0, encoding: .utf8) }?.prefix(160) ?? "")")
+        let (cc, cd) = await api("GET", "/me/library/contains?uris=spotify%3Atrack%3A5PvwPy5eRO8BPwpRzCHK3D")
+        print("spotify: library/contains → \(cc) \(cd.flatMap { String(data: $0, encoding: .utf8) }?.prefix(160) ?? "")")
+        await setShuffle(before.shuffle)
+        return
         let set1 = await setShuffle(!before.shuffle)
         try? await Task.sleep(nanoseconds: 700_000_000)
         let mid = await playbackModes()
@@ -517,8 +570,17 @@ final class SpotifyClient: ObservableObject {
         }
         if (200...299).contains(code) {
             isLiked = saving
+            if let keys = currentIndexKeys {
+                if saving {
+                    likedByKey[keys.key] = id
+                    if let isrc = keys.isrc { likedByISRC[isrc] = id }
+                } else {
+                    likedByKey.removeValue(forKey: keys.key)
+                    if let isrc = keys.isrc { likedByISRC.removeValue(forKey: isrc) }
+                }
+                saveLikedCache()
+            }
             matchedSavedID = nil
-            Task { await self.refreshLikedIndex(force: true) }
             status = saving ? "Saved to Liked Songs" : "Removed from Liked Songs"
         } else {
             isLiked = previous
