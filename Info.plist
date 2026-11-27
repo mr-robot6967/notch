@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Notch</string>
+    <key>CFBundleDisplayName</key>
+    <string>Notch</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.k2a.LockWidgets</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleExecutable</key>
+    <string>Notch</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Notch shows your next event in the calendar widget.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Notch shows your next event in the calendar widget.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Notch controls Music or Spotify playback from the notch and shows album art.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Notch shows a notch alert with the battery level when AirPods or other Bluetooth devices connect.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Notch uses your location to show local weather.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Notch uses your location to show local weather.</string>
+</dict>
+</plist>

@@ -1,0 +1,1027 @@
+import AppKit
+import ApplicationServices
+import Combine
+import CoreAudio
+import IOBluetooth
+import SwiftUI
+import LockWidgetsCore
+
+// MARK: - State
+
+/// Short-lived events shown in the notch.
+enum LiveActivity: Equatable {
+    case charging(level: Int, pluggedIn: Bool)
+    case lowBattery(level: Int)
+    case device(name: String, symbol: String, level: Int?)
+    case volume(level: Float, muted: Bool)
+    case brightness(level: Float)
+    case unlocked
+    case timerDone
+    case notification(MirroredNotification)
+    case event(title: String, minutes: Int, colorHex: String?)
+    case lowPower(Bool)
+    case focus(Bool)
+    case songChange(title: String, artist: String)
+
+    /// Key used by Settings › Notch to turn each kind on or off.
+    var settingKey: String {
+        switch self {
+        case .charging: return "charging"
+        case .lowBattery: return "lowBattery"
+        case .device: return "devices"
+        case .volume: return "volume"
+        case .brightness: return "brightness"
+        case .unlocked: return "unlock"
+        case .timerDone: return "timer"
+        case .notification: return "notifications"
+        case .event: return "calendar"
+        case .lowPower: return "lowPower"
+        case .focus: return "focus"
+        case .songChange: return "songChange"
+        }
+    }
+}
+
+enum HUDKind: Equatable { case volume, brightness }
+
+/// Pages of the expanded notch (swipe vertically to change).
+enum NotchPage: String, CaseIterable, Identifiable, Codable {
+    case nowPlaying, notifications, calendar, widgets, shelf, timer
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .nowPlaying: return "Now Playing"
+        case .notifications: return "Notifications"
+        case .calendar: return "Calendar"
+        case .widgets: return "Widgets (weather, batteries, calendar)"
+        case .shelf: return "File Shelf"
+        case .timer: return "Timer"
+        }
+    }
+}
+
+/// One set of springs for the whole island so every change morphs the same, smooth way.
+enum IslandMotion {
+    // Measured from the reference: open overshoots ~7 % and settles in ~450 ms; close is a
+    // critically damped ~200 ms; activities overshoot slightly and settle in ~330 ms.
+    static let open = Animation.spring(response: 0.34, dampingFraction: 0.62)
+    static let close = Animation.spring(response: 0.22, dampingFraction: 1.0)
+    static let activity = Animation.spring(response: 0.3, dampingFraction: 0.68)
+    static let hover = Animation.spring(response: 0.34, dampingFraction: 0.72)
+    static let page = Animation.spring(response: 0.4, dampingFraction: 0.86)
+}
+
+@MainActor
+final class NotchModel: ObservableObject {
+    static let shared = NotchModel()
+
+    /// Horizontal nudge of the whole island when a song is skipped (points; springs back to 0).
+    @Published var nudge: CGFloat = 0
+
+    /// One big jiggle in `direction` (-1 left, +1 right): lurch, then a wobbly spring back.
+    func jiggle(_ direction: CGFloat) {
+        let cfg = AppSettings.shared.config
+        guard cfg.skipJiggle else { return }
+        withAnimation(.easeOut(duration: 0.09)) { nudge = CGFloat(cfg.skipJiggleAmount) * direction }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.32)) { self.nudge = 0 }
+        }
+    }
+
+    @Published var expanded = false
+    @Published var hovering = false
+    @Published var locked = false
+    @Published private(set) var transient: LiveActivity?
+    @Published var page: NotchPage = .nowPlaying
+    @Published var dropTargeted = false
+    /// -1...1: where the pointer is across the open island, for the subtle 3D tilt.
+    @Published var pointerX: CGFloat = 0
+
+    private var clearWork: DispatchWorkItem?
+    /// When the current transient appeared (statuses are protected briefly from automatic pop-ups).
+    private(set) var transientSince = Date.distantPast
+    /// A song-change peek that arrived while a status was showing; played when it ends.
+    private var pendingPeek: (activity: LiveActivity, at: Date)?
+
+    /// Status-type activities that automatic changes (volume after a device switch, song peeks)
+    /// must not cut off.
+    static func isStatus(_ a: LiveActivity?) -> Bool {
+        switch a {
+        case .charging, .lowBattery, .device, .unlocked, .focus, .lowPower, .timerDone: return true
+        default: return false
+        }
+    }
+
+    /// True while a status appeared less than `window` seconds ago.
+    func statusIsFresh(_ window: TimeInterval = 1.5) -> Bool {
+        Self.isStatus(transient) && Date().timeIntervalSince(transientSince) < window
+    }
+
+    /// A page shown for this opening only (replying to a banner when the Notifications page is off).
+    @Published var forcedPage: NotchPage?
+
+    var availablePages: [NotchPage] {
+        let enabled = Set(AppSettings.shared.config.notchPages)
+        let pages = NotchPage.allCases.filter { enabled.contains($0.rawValue) || $0 == forcedPage }
+        return pages.isEmpty ? [.nowPlaying] : pages
+    }
+
+    func cyclePage(forward: Bool) {
+        let pages = availablePages
+        guard let index = pages.firstIndex(of: page) else { page = pages[0]; return }
+        let next = (index + (forward ? 1 : -1) + pages.count) % pages.count
+        withAnimation(IslandMotion.page) { page = pages[next] }
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+    }
+
+    /// Shows a live activity for a few seconds (if that kind is enabled in Settings).
+    func dismissTransient() {
+        clearWork?.cancel()
+        withAnimation(IslandMotion.activity) { transient = nil }
+    }
+
+    /// Called when the Mac locks: a message, event or song peek that was already up must not stay
+    /// readable on the lock screen until its timer runs out.
+    func hidePrivateTransient() {
+        switch transient {
+        case .notification, .event, .songChange: dismissTransient()
+        default: break
+        }
+    }
+
+    func flash(_ activity: LiveActivity, seconds: Double = 3) {
+        let cfg = AppSettings.shared.config
+        guard cfg.notchEnabled, !cfg.disabledActivities.contains(activity.settingKey) else { return }
+        // Respect Do Not Disturb / Focus (Settings › Focus).
+        switch activity {
+        case .notification: if FocusWatcher.shared.holds(.notification) { return }
+        case .event, .songChange: if FocusWatcher.shared.holds(.peek) { return }
+        default: break
+        }
+        // Never show message or event text on the lock screen.
+        if locked {
+            switch activity {
+            case .notification, .event, .songChange: return
+            default: break
+            }
+        }
+        // A song peek never cuts off a status that is still on screen; it plays right after.
+        if case .songChange = activity, Self.isStatus(transient) {
+            pendingPeek = (activity, Date())
+            return
+        }
+        withAnimation(IslandMotion.activity) { transient = activity }
+        transientSince = Date()
+        var seconds = seconds
+        if case .notification = activity {
+            seconds = cfg.notificationSeconds
+        } else {
+            let group = AppSettings.durationGroup(for: activity.settingKey)
+            if let custom = cfg.activityDurations[group] ?? AppSettings.defaultDurations[group] { seconds = custom }
+        }
+        clearWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            withAnimation(IslandMotion.activity) { self.transient = nil }
+            if let pending = self.pendingPeek {
+                self.pendingPeek = nil
+                if Date().timeIntervalSince(pending.at) < 6 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.flash(pending.activity) }
+                }
+            }
+        }
+        clearWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+}
+
+@MainActor
+final class NotchTimer: ObservableObject {
+    static let shared = NotchTimer()
+    @Published private(set) var endDate: Date?
+    @Published private(set) var total: TimeInterval = 0
+    private var ticker: Timer?
+
+    var isRunning: Bool { endDate != nil }
+
+    func start(minutes: Int) {
+        total = TimeInterval(minutes * 60)
+        endDate = Date().addingTimeInterval(total)
+        ticker?.invalidate()
+        let t = Timer(timeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { NotchTimer.shared.tick() }
+        }
+        t.tolerance = 0.2
+        RunLoop.main.add(t, forMode: .common)
+        ticker = t
+    }
+
+    func cancel() {
+        ticker?.invalidate()
+        ticker = nil
+        endDate = nil
+    }
+
+    func remaining(at date: Date = Date()) -> TimeInterval {
+        guard let endDate else { return 0 }
+        return max(0, endDate.timeIntervalSince(date))
+    }
+
+    private func tick() {
+        guard remaining() <= 0 else { return }
+        cancel()
+        NSSound(named: "Glass")?.play()
+        NotchModel.shared.flash(.timerDone, seconds: 6)
+    }
+}
+
+/// Files dropped on the notch, kept between launches.
+@MainActor
+final class ShelfModel: ObservableObject {
+    static let shared = ShelfModel()
+    @Published private(set) var items: [URL] = []
+
+    private init() {
+        items = AppSettings.shared.config.shelfItems
+            .map { URL(fileURLWithPath: $0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    func add(_ urls: [URL]) {
+        for url in urls where !items.contains(url) { items.append(url) }
+        save()
+    }
+
+    func remove(_ url: URL) {
+        items.removeAll { $0 == url }
+        save()
+    }
+
+    func clear() {
+        items.removeAll()
+        save()
+    }
+
+    private func save() { AppSettings.shared.config.shelfItems = items.map(\.path) }
+}
+
+// MARK: - System monitors
+
+/// Watches the default output device's volume/mute through CoreAudio (no polling).
+@MainActor
+final class VolumeMonitor {
+    var onChange: ((Float, Bool) -> Void)?
+    private var device = AudioObjectID(kAudioObjectUnknown)
+    private var registered: [AudioObjectPropertyAddress] = []
+    private var lastVolume: Float = -1
+    private var lastMuted = false
+    private var attachedAt = Date()
+    private lazy var deviceBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        MainActor.assumeIsolated { self?.changed() }
+    }
+    private lazy var defaultBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        MainActor.assumeIsolated { self?.attach() }
+    }
+
+    func start() {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, defaultBlock)
+        attach()
+    }
+
+    private func attach() {
+        for var address in registered {
+            AudioObjectRemovePropertyListenerBlock(device, &address, .main, deviceBlock)
+        }
+        registered.removeAll()
+
+        var id = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id) == noErr else { return }
+        device = id
+
+        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            for element in [kAudioObjectPropertyElementMain, 1] {
+                var a = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioDevicePropertyScopeOutput, mElement: element)
+                if AudioObjectHasProperty(device, &a) {
+                    AudioObjectAddPropertyListenerBlock(device, &a, .main, deviceBlock)
+                    registered.append(a)
+                    break
+                }
+            }
+        }
+        // Baseline, so switching devices doesn't pop the HUD.
+        (lastVolume, lastMuted) = read()
+        attachedAt = Date()
+    }
+
+    private func read() -> (Float, Bool) {
+        var volume: Float32 = 0
+        var muted: UInt32 = 0
+        for element in [kAudioObjectPropertyElementMain, 1] {
+            var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+                                               mScope: kAudioDevicePropertyScopeOutput, mElement: element)
+            var size = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectHasProperty(device, &a), AudioObjectGetPropertyData(device, &a, 0, nil, &size, &volume) == noErr { break }
+        }
+        var m = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                           mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectHasProperty(device, &m) { _ = AudioObjectGetPropertyData(device, &m, 0, nil, &size, &muted) }
+        return (volume, muted != 0)
+    }
+
+    private func changed() {
+        let (volume, muted) = read()
+        guard abs(volume - lastVolume) > 0.001 || muted != lastMuted else { return }
+        lastVolume = volume
+        lastMuted = muted
+        // A new output (AirPods, headphones) reports its own volume a moment after switching; that
+        // isn't the user changing the volume, so no pop-up for it.
+        guard Date().timeIntervalSince(attachedAt) > 2.5 else { return }
+        onChange?(volume, muted)
+    }
+}
+
+/// Fires when a Bluetooth device (AirPods, keyboard, mouse…) connects.
+final class BluetoothConnectMonitor: NSObject {
+    var onConnect: ((String) -> Void)?
+    private var notification: IOBluetoothUserNotification?
+    private var startedAt = Date()
+
+    func start() {
+        startedAt = Date()
+        notification = IOBluetoothDevice.register(forConnectNotifications: self,
+                                                  selector: #selector(connected(_:device:)))
+    }
+
+    @objc private func connected(_ note: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        // The first callbacks list devices that were already connected — ignore those.
+        guard Date().timeIntervalSince(startedAt) > 5 else { return }
+        let name = device.name ?? "Bluetooth device"
+        DispatchQueue.main.async { self.onConnect?(name) }
+    }
+}
+
+// MARK: - Window
+
+/// The Dynamic-Island-style panel over the MacBook notch. It lives on the same system layer as the
+/// lock-screen widgets, so it stays put when you switch Spaces and also shows on the lock screen.
+@MainActor
+final class NotchController {
+    static let panelSize = CGSize(width: 760, height: 300)
+
+    private let panel: NSPanel
+    private let model = NotchModel.shared
+    private let settings: AppSettings
+    private let store: WidgetStore
+    private let volume = VolumeMonitor()
+    private let bluetooth = BluetoothConnectMonitor()
+    private var monitors: [Any] = []
+    private var cancellables = Set<AnyCancellable>()
+    private var hoverWork: DispatchWorkItem?
+    private var collapseWork: DispatchWorkItem?
+    private var lastPluggedIn: Bool?
+    private var warnedLowAt: Int?
+    private var scrollX: CGFloat = 0
+    private var scrollY: CGFloat = 0
+    private var lastGesture = Date.distantPast
+    private var lastScrollEvent = Date.distantPast
+    private var gestureConsumed = false
+    private var lastInZone = false
+    private(set) var geometry = NotchGeometry.current()
+
+    init(settings: AppSettings, store: WidgetStore) {
+        self.settings = settings
+        self.store = store
+        panel = NotchPanel(contentRect: NSRect(origin: .zero, size: Self.panelSize),
+                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.ignoresMouseEvents = true
+        panel.isMovable = false
+        panel.canBecomeVisibleWithoutLogin = true
+        panel.animationBehavior = .none
+        panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 3)
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        // A window over the notch gets a "safe area" the height of the notch, and SwiftUI would push
+        // the island down by that much. The island must start at the very top edge, so opt out.
+        let host = NSHostingView(rootView: NotchRootView(controller: self)
+            .environmentObject(settings)
+            .environmentObject(store)
+            .environmentObject(model))
+        if #available(macOS 13.3, *) { host.safeAreaRegions = [] }
+        panel.contentView = host
+
+        if CommandLine.arguments.contains("--flash-test") {
+            // Plays the widest status pop-ups in turn (to check nothing wraps).
+            let samples: [LiveActivity] = [.charging(level: 100, pluggedIn: true), .charging(level: 100, pluggedIn: false),
+                                           .lowPower(true), .focus(true)]
+            for (i, sample) in samples.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2 + Double(i) * 2.5) { NotchModel.shared.flash(sample, seconds: 2.3) }
+            }
+        }
+
+        settings.$config
+            .map { "\($0.notchEnabled)|\($0.notchWidthAdjust)|\($0.notchHeightAdjust)" }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.setVisible(AppSettings.shared.config.notchEnabled) }
+            .store(in: &cancellables)
+
+        // Re-check fullscreen hiding when its setting or the lock state changes.
+        settings.$config.map(\.notchHideInFullscreen).removeDuplicates().dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateFullscreenHiding() }
+            .store(in: &cancellables)
+        // The Mission Control check polls ~8×/s, so run it only while that (opt-in) setting is on.
+        settings.$config.map { $0.notchEnabled && $0.notchHideInMissionControl }.removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] on in
+                guard let self else { return }
+                if on { self.startMissionControlWatch() } else { self.stopMissionControlWatch() }
+            }
+            .store(in: &cancellables)
+        model.$locked.removeDuplicates().dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.updateFullscreenHiding() } }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.reposition() }
+            .store(in: &cancellables)
+
+        // Charging + low battery
+        store.$mac
+            .compactMap { $0 }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] info in self?.batteryChanged(info) }
+            .store(in: &cancellables)
+
+        volume.onChange = { level, muted in
+            // Not from the keys and a status just appeared (e.g. AirPods connecting): don't cover it.
+            if Date().timeIntervalSince(MediaKeyTap.lastVolumeKeyAt) > 0.6, NotchModel.shared.statusIsFresh() { return }
+            NotchModel.shared.flash(.volume(level: level, muted: muted), seconds: 1.6)
+            if AppSettings.shared.config.notchHaptics && (level <= 0.001 || level >= 0.999 || muted) {
+                NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+            }
+        }
+        volume.start()
+        AudioDevices.shared.start()
+        BrightnessWatcher.shared.start()
+
+        bluetooth.onConnect = { name in
+            MainActor.assumeIsolated { AppDelegate.shared?.notch?.deviceConnected(name) }
+        }
+        // Registering for Bluetooth connections shows the system Bluetooth prompt; on a fresh
+        // install wait until the welcome window is done instead of prompting behind it.
+        settings.$config.map(\.onboardingDone).removeDuplicates().filter { $0 }.first()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.bluetooth.start() }
+            .store(in: &cancellables)
+
+        settings.$config
+            .map { $0.replaceSystemHUD && $0.notchEnabled }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { enabled in
+                if enabled { MediaKeyTap.shared.start() } else { MediaKeyTap.shared.stop() }
+            }
+            .store(in: &cancellables)
+        // Pick up an Accessibility grant as soon as the user comes back from System Settings.
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification))
+            .receive(on: RunLoop.main)
+            .sink { _ in
+                let cfg = AppSettings.shared.config
+                if cfg.replaceSystemHUD && cfg.notchEnabled && !MediaKeyTap.shared.isRunning { MediaKeyTap.shared.start() }
+            }
+            .store(in: &cancellables)
+
+        // Settings that change what the open island may show take effect right away: "Compact only"
+        // closes it, and a page that was just turned off is replaced by one that's still on.
+        settings.$config
+            .map { "\($0.notchExpandMode.rawValue)|\($0.notchPages)" }
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if self.settings.config.notchExpandMode == .never, self.model.expanded { self.collapse() }
+                let pages = self.model.availablePages
+                if !pages.contains(self.model.page) { self.model.page = pages[0] }
+            }
+            .store(in: &cancellables)
+
+        settings.$config
+            .map(\.notchHideFromCapture)
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] hide in self?.panel.sharingType = hide ? .none : .readOnly }
+            .store(in: &cancellables)
+
+        // Hide over fullscreen apps (videos, games); checked when apps or Spaces change.
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)
+            .merge(with: workspace.publisher(for: NSWorkspace.didActivateApplicationNotification))
+            .delay(for: .milliseconds(400), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateFullscreenHiding()
+                withAnimation(IslandMotion.activity) { self?.model.objectWillChange.send() }
+            }
+            .store(in: &cancellables)
+
+        installEventMonitors()
+        reposition()
+    }
+
+    private(set) var hiddenForFullscreen = false
+    private var missionControlOpen = false
+    private var missionControlTimer: Timer?
+
+    /// Mission Control has no public notification; while it's open the Dock shows a full-screen
+    /// window on layer 20. A cheap check a few times a second; the island hides while it's there.
+    private func startMissionControlWatch() {
+        missionControlTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.12, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let self = AppDelegate.shared?.notch, self.settings.config.notchEnabled,
+                      self.settings.config.notchHideInMissionControl else { return }
+                self.ensureDockObserver()
+                var open = Self.missionControlIsOpen()
+                // The Dock keeps its window through the closing zoom; once it has said "exit", the
+                // island comes back straight away instead of waiting for that window to go.
+                if open, let exit = self.exposeExitAt, Date().timeIntervalSince(exit) < 1.0 { open = false }
+                if open != self.missionControlOpen {
+                    self.missionControlOpen = open
+                    self.updateFullscreenHiding()
+                }
+            }
+        }
+        timer.tolerance = 0.03
+        RunLoop.main.add(timer, forMode: .common)
+        missionControlTimer = timer
+    }
+
+    private func stopMissionControlWatch() {
+        missionControlTimer?.invalidate()
+        missionControlTimer = nil
+        if missionControlOpen {
+            missionControlOpen = false
+            updateFullscreenHiding()
+        }
+    }
+
+    private var exposeExitAt: Date?
+    private var dockObserver: AXObserver?
+    private var dockObserverPID: pid_t = 0
+
+    /// With Accessibility allowed, the Dock tells us the moment Mission Control opens or starts
+    /// closing (no polling delay). Re-created if the Dock restarts.
+    private func ensureDockObserver() {
+        guard AXIsProcessTrusted(),
+              let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return }
+        let pid = dock.processIdentifier
+        guard dockObserver == nil || pid != dockObserverPID else { return }
+        if let old = dockObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(old), .commonModes)
+            dockObserver = nil
+        }
+        var observer: AXObserver?
+        let callback: AXObserverCallback = { _, _, name, _ in
+            let opening = (name as String) != "AXExposeExit"
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { AppDelegate.shared?.notch?.dockExpose(opening: opening) }
+            }
+        }
+        guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
+        let app = AXUIElementCreateApplication(pid)
+        for name in ["AXExposeShowAllWindows", "AXExposeShowFrontWindows", "AXExposeShowDesktop", "AXExposeExit"] {
+            AXObserverAddNotification(observer, app, name as CFString, nil)
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        dockObserver = observer
+        dockObserverPID = pid
+    }
+
+    fileprivate func dockExpose(opening: Bool) {
+        guard settings.config.notchHideInMissionControl else { return }
+        exposeExitAt = opening ? nil : Date()
+        guard opening != missionControlOpen else { return }
+        missionControlOpen = opening
+        updateFullscreenHiding()
+    }
+
+    private static func missionControlIsOpen() -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+        return list.contains { w in
+            (w[kCGWindowOwnerName as String] as? String) == "Dock" && (w[kCGWindowLayer as String] as? Int) == 20
+        }
+    }
+
+    func updateFullscreenHiding() {
+        let fullscreen = settings.config.notchHideInFullscreen && Self.frontmostIsFullscreen(on: geometry)
+        let missionControl = settings.config.notchHideInMissionControl && missionControlOpen
+        let hide = settings.config.notchEnabled && !model.locked && (fullscreen || missionControl)
+        guard hide != hiddenForFullscreen || panel.alphaValue != (hide ? 0 : 1) else { return }
+        hiddenForFullscreen = hide
+        if hide {
+            panel.ignoresMouseEvents = true
+            if model.expanded { collapse() }
+        }
+        // Hide at once (Mission Control and fullscreen open fast); fade back in gently.
+        if hide {
+            panel.alphaValue = 0
+        } else {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.1
+                panel.animator().alphaValue = 1
+            }
+        }
+    }
+
+    /// True when the frontmost app has a window covering the whole notch display (fullscreen).
+    private static func frontmostIsFullscreen(on g: NotchGeometry) -> Bool {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              let screen = NSScreen.screens.first(where: { abs($0.frame.maxY - g.screenTop) < 1 && $0.frame.minX <= g.centerX && $0.frame.maxX >= g.centerX }),
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        // CG window bounds are top-left based on the primary display; convert the notch screen's frame.
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
+        let screenTopLeftY = primaryHeight - screen.frame.maxY
+        for w in list where (w[kCGWindowOwnerPID as String] as? Int32) == pid && (w[kCGWindowLayer as String] as? Int) == 0 {
+            guard let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            let x = b["X"] ?? .infinity, y = b["Y"] ?? .infinity
+            if abs(x - screen.frame.minX) < 2, abs(y - screenTopLeftY) < 2,
+               (b["Width"] ?? 0) >= screen.frame.width, (b["Height"] ?? 0) >= screen.frame.height { return true }
+        }
+        return false
+    }
+
+    private func setVisible(_ visible: Bool) {
+        if visible {
+            reposition()
+            SkyLight.shared.moveToLockScreen(panel)
+            panel.orderFrontRegardless()
+            updateFullscreenHiding()
+        } else {
+            // Don't come back already open (and stuck that way) when the island is turned on again.
+            if model.expanded { collapse() }
+            panel.orderOut(nil)
+        }
+    }
+
+    private func reposition() {
+        geometry = NotchGeometry.current(widthAdjust: settings.config.notchWidthAdjust,
+                                         heightAdjust: settings.config.notchHeightAdjust)
+        let size = Self.panelSize
+        panel.setFrame(NSRect(x: geometry.centerX - size.width / 2, y: geometry.screenTop - size.height,
+                              width: size.width, height: size.height), display: true)
+        model.objectWillChange.send()
+    }
+
+    private func batteryChanged(_ info: MacBatteryInfo) {
+        if let last = lastPluggedIn, last != info.isPluggedIn {
+            BrightnessWatcher.shared.powerSourceChanged()
+            model.flash(.charging(level: info.level, pluggedIn: info.isPluggedIn))
+        }
+        lastPluggedIn = info.isPluggedIn
+        let threshold = settings.config.lowBatteryThreshold
+        if !info.isPluggedIn, info.level <= threshold, warnedLowAt == nil || info.level <= (warnedLowAt ?? 0) - 10 {
+            warnedLowAt = info.level
+            model.flash(.lowBattery(level: info.level), seconds: 4)
+            if settings.config.lockSounds { SystemSounds.play("Funk") }
+        }
+        if info.isPluggedIn || info.level > threshold { warnedLowAt = nil }
+    }
+
+    func deviceConnected(_ name: String) {
+        // Give the device a moment to report its battery, then show it.
+        store.refreshPeripherals(fullScan: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self else { return }
+            let matches = self.store.peripherals.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            let level = matches.filter { $0.component != "Case" }.map(\.level).min() ?? matches.first?.level
+            let symbol = matches.first.map { $0.kind == .earbudLeft || $0.kind == .earbudRight ? "airpodspro" : $0.kind.symbol }
+                ?? DeviceKind.guess(from: name).symbol
+            self.model.flash(.device(name: name, symbol: symbol, level: level), seconds: 4)
+        }
+    }
+
+    // MARK: Size
+
+    /// Everything is sized from the Mac's real notch, so it fits any MacBook: 1.0 on a 37.5 pt notch.
+    var scale: CGFloat { min(1.35, max(0.75, geometry.height / 37.5)) }
+
+    /// Size of the black island for the current state (shared with the view).
+    func islandSize() -> CGSize {
+        let g = geometry
+        let k = scale
+        if model.expanded { return CGSize(width: max(368 * k, g.width + 160 * k), height: 179.5 * k) }
+        let content = NotchContent.current(model: model)
+        // Breathe a little when the pointer reaches the notch, so it feels alive.
+        let grow: CGFloat = model.hovering && hoverZone().contains(NSEvent.mouseLocation) ? 1 : 0
+        if case .transient(.notification) = content { return CGSize(width: max(340 * k, g.width + 140 * k), height: g.height + 56 * k) }
+        if case .transient(.songChange) = content { return CGSize(width: max(300 * k, g.width + 92 * k), height: 80 * k) }
+        switch content {
+        case .idle: return CGSize(width: g.width + 6 * k * grow, height: g.height + 2 * k * grow)
+        case .nowPlaying: return CGSize(width: g.width + 2 * 37 * k + 4 * k * grow, height: g.height + 1.5 * k * grow)
+        case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * k, height: g.height)
+        case .device: return CGSize(width: g.width + 2 * 82 * k, height: g.height)
+        case .transient(.event): return CGSize(width: g.width + 2 * 110 * k, height: g.height)
+        case .transient(.charging): return CGSize(width: g.width + 2 * 74 * k, height: g.height)
+        case .transient(.lowPower): return CGSize(width: g.width + 2 * 80 * k, height: g.height)
+        case .transient(.focus): return CGSize(width: g.width + 2 * 64 * k, height: g.height)
+        case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * k, height: g.height)
+        case .timer: return CGSize(width: g.width + 2 * 70 * k, height: g.height)
+        case .locked: return CGSize(width: g.width + 2 * (g.height * 0.8), height: g.height)
+        case .idleWeather: return CGSize(width: g.width + 2 * (g.height * 0.95), height: g.height)
+        default: return CGSize(width: g.width + 2 * 50 * k, height: g.height)
+        }
+    }
+
+    /// Where hovering opens the island: the notch itself at the top edge, not the area around it.
+    private func hoverZone() -> NSRect {
+        let g = geometry
+        return NSRect(x: g.centerX - g.width / 2 - 4, y: g.screenTop - g.height, width: g.width + 8, height: g.height + 1)
+    }
+
+    private func islandRect(padding: CGFloat) -> NSRect {
+        let size = islandSize()
+        return NSRect(x: geometry.centerX - size.width / 2 - padding, y: geometry.screenTop - size.height - padding,
+                      width: size.width + 2 * padding, height: size.height + padding)
+    }
+
+    /// Tapping a replyable banner: open the island on Notifications with that message's reply field.
+    /// Returns false when the island can't open (Compact only, locked…) so the caller opens the app.
+    @discardableResult
+    func openReply(to note: MirroredNotification) -> Bool {
+        guard note.canReply, settings.config.notchExpandMode != .never, !model.locked, !hiddenForFullscreen else { return false }
+        model.forcedPage = .notifications
+        model.page = .notifications
+        let reply = ReplyState.shared
+        reply.activeID = note.id
+        reply.text = ""
+        reply.status = nil
+        expand()
+        guard model.expanded else { model.forcedPage = nil; return false }
+        // The text field needs a key window to type into.
+        panel.makeKey()
+        return true
+    }
+
+    /// Let the reply field take typing (the island is a non-activating panel).
+    func focusPanel() { panel.makeKey() }
+
+    func expand() {
+        // Hidden over a fullscreen app the panel is transparent and ignores the mouse, so an island
+        // opened from the context menu or Settings there would stay open, invisibly, until later.
+        guard settings.config.notchEnabled, settings.config.notchExpandMode != .never, !model.locked,
+              !hiddenForFullscreen else { return }
+        if !model.availablePages.contains(model.page) { model.page = model.availablePages[0] }
+        withAnimation(IslandMotion.open) { model.expanded = true }
+        if settings.config.notchHaptics { NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now) }
+    }
+
+    private(set) var justCollapsed = false
+
+    private var collapseGeneration = 0
+
+    func collapse() {
+        model.forcedPage = nil
+        justCollapsed = true
+        collapseGeneration += 1
+        let generation = collapseGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            if self?.collapseGeneration == generation { self?.justCollapsed = false }
+        }
+        withAnimation(IslandMotion.close) {
+            model.expanded = false
+            model.pointerX = 0
+        }
+        panel.ignoresMouseEvents = true
+        relinquishKeyFocus()
+    }
+
+    /// Typing a reply makes this non-activating panel the key window, and it stays key after the
+    /// island closes — so the next keystrokes meant for the app in front went nowhere. Ordering the
+    /// panel out hands key focus back to the active app's window; it is put straight back (same
+    /// run-loop turn, so nothing flickers) on the lock-screen layer it lives in.
+    private func relinquishKeyFocus() {
+        guard panel.isKeyWindow, panel.isVisible else { return }
+        panel.orderOut(nil)
+        SkyLight.shared.moveToLockScreen(panel)
+        panel.orderFrontRegardless()
+    }
+
+    // MARK: Mouse + gestures
+
+    private func installEventMonitors() {
+        let handler: (NSEvent) -> Void = { event in
+            MainActor.assumeIsolated { AppDelegate.shared?.notch?.handle(event) }
+        }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .scrollWheel]
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler) { monitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
+            handler(event)
+            return event
+        }) { monitors.append(local) }
+    }
+
+    fileprivate func handle(_ event: NSEvent) {
+        guard settings.config.notchEnabled, !hiddenForFullscreen else { return }
+        if event.type == .scrollWheel {
+            handleScroll(event)
+        } else {
+            mouseMoved()
+        }
+    }
+
+    /// Two-finger swipes over the island: horizontal = previous/next track, vertical = change page,
+    /// swipe down on the collapsed island = open, swipe up when open = close.
+    private func handleScroll(_ event: NSEvent) {
+        // Trackpad inertia keeps sending "momentum" events after the fingers lift; acting on those
+        // made the island flip pages by itself. Only real finger movement counts.
+        guard event.momentumPhase.isEmpty else { return }
+        guard islandRect(padding: model.expanded ? 18 : 8).contains(NSEvent.mouseLocation) else {
+            resetScroll()
+            return
+        }
+        let now = Date()
+        // New gesture: trackpad says .began; for mouse wheels, a pause starts a new one.
+        if event.phase == .began || now.timeIntervalSince(lastScrollEvent) > 0.3 {
+            resetScroll()
+        }
+        lastScrollEvent = now
+        if event.phase == .ended || event.phase == .cancelled {
+            resetScroll()
+            return
+        }
+        // One action per physical swipe.
+        guard !gestureConsumed else { return }
+        // Mouse wheels report lines, trackpads points; make both reach the threshold. Normalise
+        // natural scrolling so "down" always means the fingers moved down.
+        let factor: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 12
+        let invert: CGFloat = event.isDirectionInvertedFromDevice ? -1 : 1
+        scrollX += event.scrollingDeltaX * factor * invert
+        scrollY += event.scrollingDeltaY * factor * invert
+        guard now.timeIntervalSince(lastGesture) > 0.35 else { return }
+        let threshold: CGFloat = 38
+        if abs(scrollX) > threshold, abs(scrollX) > abs(scrollY) * 1.4, settings.config.swipeToSkip, MediaController.shared.info != nil {
+            // scrollX runs opposite to the fingers: swipe left (scrollX > 0) = next song, right = previous.
+            scrollX > 0 ? MediaController.shared.next() : MediaController.shared.previous()
+            // Jiggle the island the way the fingers moved.
+            model.jiggle(scrollX > 0 ? -1 : 1)
+            gestureDone()
+        } else if abs(scrollY) > threshold, abs(scrollY) > abs(scrollX) * 1.4 {
+            if !model.expanded {
+                if scrollY < 0 { expand() }
+                else if model.transient != nil { model.dismissTransient() } // swipe up dismisses an activity
+            } else if scrollY > 0, model.availablePages.count <= 1 {
+                collapse()
+            } else {
+                model.cyclePage(forward: scrollY < 0)
+            }
+            gestureDone()
+        }
+    }
+
+    private func gestureDone() {
+        lastGesture = Date()
+        gestureConsumed = true
+        scrollX = 0
+        scrollY = 0
+    }
+
+    private func resetScroll() {
+        scrollX = 0
+        scrollY = 0
+        gestureConsumed = false
+    }
+
+    private func mouseMoved() {
+        let mouse = NSEvent.mouseLocation
+        let dragging = NSEvent.pressedMouseButtons & 1 != 0
+        let inside = islandRect(padding: model.expanded ? 18 : 6).contains(mouse)
+        // Accept clicks/drops only over the island; everywhere else clicks pass through.
+        panel.ignoresMouseEvents = !inside
+        let inZone = hoverZone().contains(mouse)
+        if inside != model.hovering || inZone != lastInZone {
+            lastInZone = inZone
+            withAnimation(IslandMotion.hover) {
+                model.hovering = inside
+                model.objectWillChange.send()
+            }
+        }
+
+
+        if inside && !model.expanded {
+            collapseWork?.cancel()
+            collapseWork = nil
+            // Opening needs the pointer up in the notch itself (or a file being dragged near it).
+            guard dragging || hoverZone().contains(mouse) else { hoverWork?.cancel(); hoverWork = nil; return }
+            let hover = settings.config.notchExpandMode == .hover
+            guard (hover || dragging), settings.config.notchExpandMode != .never, !model.locked else { return }
+            if hoverWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.hoverWork = nil
+                    guard dragging || self.hoverZone().contains(NSEvent.mouseLocation) else { return }
+                    if dragging { self.model.page = .shelf }
+                    self.expand()
+                }
+                hoverWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + (dragging ? 0.05 : max(0.01, settings.config.hoverDelay)), execute: work)
+            }
+        } else if !inside {
+            hoverWork?.cancel()
+            hoverWork = nil
+            if model.expanded && collapseWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.collapseWork = nil
+                    if !self.islandRect(padding: 18).contains(NSEvent.mouseLocation) { self.collapse() }
+                }
+                collapseWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+            }
+        }
+    }
+}
+
+private final class NotchPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+/// Where the notch is. On Macs without a notch (or with the system Dynamic Island) a notch-sized
+/// pill is drawn at the top centre of the main display instead.
+struct NotchGeometry {
+    var centerX: CGFloat
+    var screenTop: CGFloat
+    var width: CGFloat
+    var height: CGFloat
+    var hasNotch: Bool
+
+    static func current(widthAdjust: Double = 0, heightAdjust: Double = 0) -> NotchGeometry {
+        let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.screens.first
+        guard let screen else { return NotchGeometry(centerX: 0, screenTop: 0, width: 200, height: 32, hasNotch: false) }
+        var g: NotchGeometry
+        // Only trust the notch areas when they describe a plausible notch; otherwise (no notch,
+        // odd values from a mirrored/scaled display) fall back to a pill so the island is never
+        // zero-sized or off to one side.
+        if screen.safeAreaInsets.top > 0, let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea,
+           case let width = screen.frame.width - left.width - right.width, width > 40, width < screen.frame.width / 2 {
+            g = NotchGeometry(centerX: screen.frame.minX + left.width + width / 2, screenTop: screen.frame.maxY,
+                              width: width, height: screen.safeAreaInsets.top, hasNotch: true)
+        } else {
+            g = NotchGeometry(centerX: screen.frame.midX, screenTop: screen.frame.maxY,
+                              width: 190, height: max(24, screen.frame.maxY - screen.visibleFrame.maxY), hasNotch: false)
+        }
+        g.width = max(120, g.width + CGFloat(widthAdjust))
+        g.height = max(20, g.height + CGFloat(heightAdjust))
+        return g
+    }
+}
+
+/// What the collapsed island shows, in priority order.
+enum NotchContent: Equatable {
+    case idle
+    case locked
+    case transient(LiveActivity)
+    case hud(HUDKind, Float, Bool)
+    case device
+    case timer
+    case nowPlaying
+    case idleWeather
+
+    @MainActor
+    static func current(model: NotchModel) -> NotchContent {
+        let cfg = AppSettings.shared.config
+        if let t = model.transient {
+            switch t {
+            case .volume(let level, let muted): return .hud(.volume, level, muted)
+            case .brightness(let level): return .hud(.brightness, level, false)
+            case .device: return .device
+            default: return .transient(t)
+            }
+        }
+        if model.locked, cfg.lockedIndicator != "none" { return .locked }
+        if NotchTimer.shared.isRunning { return .timer }
+        if let info = MediaController.shared.info, info.isPlaying, !cfg.disabledActivities.contains("nowPlaying"),
+           !(cfg.notchHideWhenSourceActive && info.bundleIdentifier == NSWorkspace.shared.frontmostApplication?.bundleIdentifier) {
+            return .nowPlaying
+        }
+        if cfg.idleActivity == "weather", WidgetStore.shared.weather != nil { return .idleWeather }
+        return .idle
+    }
+}
