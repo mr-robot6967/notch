@@ -888,6 +888,7 @@ private struct BatteriesTab: View {
             Section("Display") {
                 Toggle("Show percentage under gauges", isOn: $settings.config.showPercentText)
                 Toggle("Show Mac time remaining (Wide style)", isOn: $settings.config.showTimeRemaining)
+                Toggle("Show both AirPods as one", isOn: $settings.config.combineEarbuds)
                 Picker("Red below", selection: $settings.config.lowBatteryThreshold) {
                     ForEach([5, 10, 15, 20, 25, 30, 40, 50], id: \.self) { Text("\($0)%").tag($0) }
                 }

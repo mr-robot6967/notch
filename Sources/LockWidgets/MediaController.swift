@@ -100,7 +100,31 @@ final class MediaController: ObservableObject {
         guard !started else { return }
         started = true
         if !startHelper() { startFallback() }
+        // MediaRemote can drop a client's registration while the Mac sleeps (mediaremoted restarts),
+        // leaving the player frozen on whatever was playing. Ask the helper to re-register and
+        // re-read after wake/unlock; if it had given up and we're on the fallback, try it again.
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { MediaController.shared.refreshAfterWake() }
+            }
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"),
+                                                            object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { MediaController.shared.refreshAfterWake() }
+        }
     }
+
+    private func refreshAfterWake() {
+        if usingHelper {
+            send("refresh")
+        } else if helper == nil, helperRetry == nil {
+            helperFailures = 0
+            _ = startHelper()
+        }
+    }
+
+    private var helperRetry: DispatchWorkItem?
 
     // MARK: Controls
 
@@ -244,20 +268,36 @@ final class MediaController: ObservableObject {
         helperInput = nil
         usingHelper = false
         buffer.removeAll()
-        info = nil
-        setArtwork(nil)
+        // A restart (e.g. after sleep) takes ~3 s and the new helper reports the same track at once;
+        // clearing straight away made the player vanish and reappear. Clear only if nothing comes back.
+        clearWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return } // (any message from a restarted helper cancels this)
+            self.info = nil
+            self.setArtwork(nil)
+        }
+        clearWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
         // Only count quick crashes; a helper that ran for a while (e.g. until sleep) resets the count.
         if Date().timeIntervalSince(helperStartedAt) > 120 { helperFailures = 0 }
         helperFailures += 1
         mediaLog.error("Now Playing helper exited (status \(status)); failures=\(self.helperFailures)")
-        // Retry a couple of times (e.g. after sleep), then fall back for good.
-        if helperFailures <= 2 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                MainActor.assumeIsolated { if !MediaController.shared.startHelper() { MediaController.shared.startFallback() } }
+        // Retry quickly a couple of times, then use the fallback meanwhile but keep retrying slowly:
+        // three quick failures while mediaremoted was still starting after wake used to switch to
+        // the Music/Spotify-only fallback for good, until relaunch.
+        if helperFailures > 2 { startFallback() }
+        let delay: TimeInterval = helperFailures <= 2 ? 3 : min(600, 30 * Double(helperFailures - 2))
+        helperRetry?.cancel()
+        let retry = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let media = MediaController.shared
+                media.helperRetry = nil
+                guard media.helper == nil else { return }
+                if !media.startHelper() { media.startFallback() }
             }
-        } else {
-            startFallback()
         }
+        helperRetry = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: retry)
     }
 
     private func receive(_ data: Data) {
@@ -272,6 +312,12 @@ final class MediaController: ObservableObject {
 
     private func handleHelper(_ o: [String: Any]) {
         guard o["type"] as? String == "nowPlaying" else { return }
+        // The helper works again: stop the fallback, whose events would otherwise overwrite it.
+        if !fallbackCancellables.isEmpty {
+            fallbackCancellables.removeAll()
+            fallbackApp = nil
+            mediaLog.notice("Now Playing helper is back; fallback stopped")
+        }
         if o["empty"] as? Bool == true {
             // Players report "nothing" for a moment between tracks; clearing at once made the player
             // (and its button animations) vanish and flash "Nothing playing". Clear only if it lasts.

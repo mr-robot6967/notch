@@ -348,7 +348,16 @@ final class LockScreenOverlay: ObservableObject {
         for delay in [0.4, 1.5] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self else { return }
-                if !self.isLocked, Self.sessionIsLocked() { self.didLock(source: "wake"); return }
+                let sessionLocked = Self.sessionIsLocked()
+                if !self.isLocked, sessionLocked { self.didLock(source: "wake"); return }
+                // Waking with Touch ID / Apple Watch can unlock before (or without) an unlock
+                // notification reaching us. Re-showing just because `isLocked` was still true put the
+                // lock-screen widgets back over the desktop. The session flag can lag a moment after
+                // wake, so only the later check unlocks; neither check re-shows.
+                if self.isLocked, !sessionLocked {
+                    if delay >= 1.5 { self.didUnlock(source: "wake") }
+                    return
+                }
                 guard self.isLocked, self.enabled else { return }
                 self.show()
             }

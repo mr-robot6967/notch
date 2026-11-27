@@ -53,6 +53,14 @@ final class WallpaperBaker {
         .debounce(for: .seconds(5), scheduler: RunLoop.main)
         .sink { [weak self] in self?.bake() }
         .store(in: &cancellables)
+
+        // A display connected, removed or changed resolution kept the old render (wrong size, or none
+        // for the new screen, so its lock screen showed no widgets) until the 5-minute timer.
+        // bake() records new displays' originals and does nothing when the mode is off.
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .debounce(for: .seconds(2), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.bake() }
+            .store(in: &cancellables)
     }
 
     static func key(for screen: NSScreen) -> String {

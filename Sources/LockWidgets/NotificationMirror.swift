@@ -84,7 +84,46 @@ final class NotificationMirror: ObservableObject {
     private func enable() {
         guard !running else { return }
         running = true
-        // Learn where we are without showing old notifications.
+        primePosition()
+        // Safety net: WAL checkpoints can replace the watched file.
+        let timer = Timer(timeInterval: 15, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let mirror = NotificationMirror.shared
+                // The WAL is deleted/replaced on checkpoints and around sleep; if the re-watch found
+                // no file at that moment the watcher was gone for good and banners came only from this
+                // 15 s timer. Re-attach whenever the watched file is no longer the current one.
+                if mirror.running, mirror.hasAccess, mirror.lastID >= 0, !mirror.watchIsCurrent() { mirror.watch() }
+                mirror.scheduleRead()
+            }
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        fallbackTimer = timer
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    let mirror = NotificationMirror.shared
+                    guard mirror.running, mirror.hasAccess, mirror.lastID >= 0 else { return }
+                    mirror.watch()
+                    mirror.scheduleRead()
+                }
+            }
+        }
+    }
+
+    private var wakeObserver: NSObjectProtocol?
+    private var watchedInode: ino_t = 0
+
+    private func watchIsCurrent() -> Bool {
+        guard watcher != nil else { return false }
+        var info = stat()
+        guard stat(dbDir.appendingPathComponent("db-wal").path, &info) == 0 else { return true } // no WAL right now
+        return info.st_ino == watchedInode
+    }
+
+    /// Learn where we are without showing old notifications.
+    private func primePosition() {
         readQueue.async { [dbDir] in
             let result = Self.readRecords(in: dbDir, after: nil)
             DispatchQueue.main.async {
@@ -93,6 +132,10 @@ final class NotificationMirror: ObservableObject {
                     // Turned off (or off and on again) while this first read was running.
                     guard mirror.running, mirror.lastID < 0 else { return }
                     switch result {
+                    case .failure(.failed):
+                        // A copy that raced a checkpoint (or the database busy at login) is not "no
+                        // Full Disk Access"; that used to switch mirroring off until Settings rechecked.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { NotificationMirror.shared.primePosition() }
                     case .failure:
                         mirror.hasAccess = false
                         // Nothing to read without Full Disk Access: stop the 15 s safety-net timer
@@ -100,21 +143,14 @@ final class NotificationMirror: ObservableObject {
                         mirror.fallbackTimer?.invalidate()
                         mirror.fallbackTimer = nil
                         notifLog.notice("No access to the notification database (Full Disk Access needed)")
-                    case .success(let rows):
+                    case .success(let result):
                         mirror.hasAccess = true
-                        mirror.lastID = rows.map(\.id).max() ?? 0
+                        mirror.lastID = result.maxID
                         mirror.watch()
                     }
                 }
             }
         }
-        // Safety net: WAL checkpoints can replace the watched file.
-        let timer = Timer(timeInterval: 15, repeats: true) { _ in
-            MainActor.assumeIsolated { NotificationMirror.shared.scheduleRead() }
-        }
-        timer.tolerance = 5
-        RunLoop.main.add(timer, forMode: .common)
-        fallbackTimer = timer
     }
 
     private func disable() {
@@ -137,8 +173,10 @@ final class NotificationMirror: ObservableObject {
         guard running else { return }
         let wal = dbDir.appendingPathComponent("db-wal").path
         let fd = open(wal, O_EVTONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else { return } // no WAL at the moment; the 15 s check re-attaches
         watchedFD = fd
+        var info = stat()
+        watchedInode = fstat(fd, &info) == 0 ? info.st_ino : 0
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
         source.setEventHandler { [weak self] in
             guard let self else { return }
@@ -164,9 +202,20 @@ final class NotificationMirror: ObservableObject {
     private func readNew() {
         let after = lastID
         readQueue.async { [dbDir] in
-            guard case .success(let rows) = Self.readRecords(in: dbDir, after: after) else { return }
+            guard case .success(let result) = Self.readRecords(in: dbDir, after: after) else { return }
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { NotificationMirror.shared.deliver(rows) }
+                MainActor.assumeIsolated {
+                    let mirror = NotificationMirror.shared
+                    // Notification Center rebuilt its database (ids start again lower): nothing would
+                    // ever be "after" our old position again, so resync to the new newest id. (A big
+                    // drop only: a copy that missed the WAL can lag slightly behind and is no reset.)
+                    if result.rows.isEmpty, result.maxID < after / 2, mirror.running, mirror.lastID == after {
+                        notifLog.notice("Notification database was reset; resyncing")
+                        mirror.lastID = result.maxID
+                        return
+                    }
+                    mirror.deliver(result.rows)
+                }
             }
         }
     }
@@ -206,14 +255,15 @@ final class NotificationMirror: ObservableObject {
     nonisolated static func selfTest() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Group Containers/group.com.apple.usernoted/db2", isDirectory: true)
-        guard case .success(let head) = readRecords(in: dir, after: nil), let maxID = head.first?.id else {
+        guard case .success(let head) = readRecords(in: dir, after: nil), case let maxID = head.maxID, maxID > 0 else {
             print("notifications: no access (Full Disk Access needed)")
             return
         }
-        guard case .success(let rows) = readRecords(in: dir, after: max(0, maxID - 20)) else {
+        guard case .success(let result) = readRecords(in: dir, after: max(0, maxID - 20)) else {
             print("notifications: read failed")
             return
         }
+        let rows = result.rows
         let withText = rows.filter { !$0.title.isEmpty || !$0.body.isEmpty }.count
         print("notifications: newest id \(maxID), read \(rows.count) recent rows (\(withText) with text) from \(Set(rows.map(\.bundleID)).sorted())")
     }
@@ -222,7 +272,8 @@ final class NotificationMirror: ObservableObject {
 
     private enum ReadError: Error { case noAccess, failed }
 
-    nonisolated private static func readRecords(in dir: URL, after: Int64?) -> Result<[MirroredNotification], ReadError> {
+    /// `maxID` is the newest record id in the database (the starting point when `after` is nil).
+    nonisolated private static func readRecords(in dir: URL, after: Int64?) -> Result<(rows: [MirroredNotification], maxID: Int64), ReadError> {
         let fm = FileManager.default
         let db = dir.appendingPathComponent("db")
         guard fm.isReadableFile(atPath: db.path), (try? Data(contentsOf: db, options: .alwaysMapped).prefix(16)) != nil else {
@@ -232,15 +283,18 @@ final class NotificationMirror: ObservableObject {
         let temp = fm.temporaryDirectory.appendingPathComponent("lw-notif-\(UUID().uuidString)", isDirectory: true)
         do {
             try fm.createDirectory(at: temp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            for name in ["db", "db-wal", "db-shm"] {
+            try fm.copyItem(at: dir.appendingPathComponent("db"), to: temp.appendingPathComponent("db"))
+            // The WAL/SHM can vanish between a check and the copy (checkpoint); that's fine.
+            for name in ["db-wal", "db-shm"] {
                 let source = dir.appendingPathComponent(name)
                 if fm.fileExists(atPath: source.path) {
-                    try fm.copyItem(at: source, to: temp.appendingPathComponent(name))
+                    try? fm.copyItem(at: source, to: temp.appendingPathComponent(name))
                 }
             }
         } catch {
+            // The database was readable a moment ago, so this is a transient failure, not missing access.
             try? fm.removeItem(at: temp)
-            return .failure(.noAccess)
+            return .failure(.failed)
         }
         defer { try? fm.removeItem(at: temp) }
 
@@ -263,16 +317,17 @@ final class NotificationMirror: ObservableObject {
         sqlite3_bind_int64(statement, 1, after ?? Int64.max - 1)
 
         var rows: [MirroredNotification] = []
-        if after == nil {
-            var maxStatement: OpaquePointer?
-            if sqlite3_prepare_v2(handle, "SELECT IFNULL(MAX(rec_id), 0) FROM record", -1, &maxStatement, nil) == SQLITE_OK,
-               sqlite3_step(maxStatement) == SQLITE_ROW {
-                let id = sqlite3_column_int64(maxStatement, 0)
-                rows.append(MirroredNotification(id: id, bundleID: "", appName: "", title: "", subtitle: "", body: "", date: .distantPast))
-            }
+        var maxID: Int64 = 0
+        var maxStatement: OpaquePointer?
+        if sqlite3_prepare_v2(handle, "SELECT IFNULL(MAX(rec_id), 0) FROM record", -1, &maxStatement, nil) == SQLITE_OK,
+           sqlite3_step(maxStatement) == SQLITE_ROW {
+            maxID = sqlite3_column_int64(maxStatement, 0)
+        } else {
             sqlite3_finalize(maxStatement)
-            return .success(rows)
+            return .failure(.failed)
         }
+        sqlite3_finalize(maxStatement)
+        if after == nil { return .success((rows, maxID)) }
 
         while sqlite3_step(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
@@ -299,6 +354,6 @@ final class NotificationMirror: ObservableObject {
             rows.append(MirroredNotification(id: id, bundleID: bundle, appName: appName,
                                              title: title, subtitle: subtitle, body: body, date: date))
         }
-        return .success(rows)
+        return .success((rows, maxID))
     }
 }

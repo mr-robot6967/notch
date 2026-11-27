@@ -97,6 +97,8 @@ static void schedule_emit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ emit(); });
 }
 
+static MRRegister registerFn;
+
 static void handle_command(NSString *line) {
     NSArray<NSString *> *parts = [line componentsSeparatedByString:@" "];
     NSString *cmd = parts.firstObject;
@@ -110,7 +112,12 @@ static void handle_command(NSString *line) {
     else if ([cmd isEqualToString:@"shuffle"]) sendCommand(6, nil); // toggle shuffle
     else if ([cmd isEqualToString:@"repeat"]) sendCommand(7, nil);  // toggle repeat
     else if ([cmd isEqualToString:@"seek"] && parts.count > 1 && setElapsed) setElapsed(parts[1].doubleValue);
-    else if ([cmd isEqualToString:@"refresh"]) schedule_emit();
+    else if ([cmd isEqualToString:@"refresh"]) {
+        // Sent by the app after wake/unlock: mediaremoted may have restarted and forgotten our
+        // registration, so register again (harmless if it didn't) and re-read the current state.
+        if (registerFn) registerFn(dispatch_get_main_queue());
+        schedule_emit();
+    }
 }
 
 // Called from perl via DynaLoader::dl_install_xsub; perl passes (interpreter, cv), which we ignore.
@@ -128,6 +135,7 @@ void lw_stream(void) {
         exit(3);
     }
 
+    registerFn = reg;
     reg(dispatch_get_main_queue());
     for (NSString *name in @[@"kMRMediaRemoteNowPlayingInfoDidChangeNotification",
                              @"kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification",

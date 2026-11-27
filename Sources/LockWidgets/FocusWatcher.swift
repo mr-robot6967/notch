@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -39,7 +40,23 @@ final class FocusWatcher: ObservableObject {
             MainActor.assumeIsolated { self?.refresh(announce: true) }
         }
         poll?.tolerance = 5
+        // A Focus that changed while the Mac slept, was locked or was switched away from (a bedtime
+        // or work schedule, the Sleep Focus ending at wake) was announced as if the user had just
+        // toggled it. Pick such changes up quietly.
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    let watcher = FocusWatcher.shared
+                    watcher.quietUntil = Date().addingTimeInterval(10)
+                    watcher.refresh(announce: false)
+                }
+            }
+        }
     }
+
+    private var quietUntil = Date.distantPast
 
     private func scheduleRefresh() {
         debounce?.cancel()
@@ -57,7 +74,7 @@ final class FocusWatcher: ObservableObject {
                 let changed = state.active != self.active
                 self.active = state.active
                 self.modeName = state.name
-                if changed && announce {
+                if changed && announce && Date() >= self.quietUntil && !NotchModel.shared.locked {
                     NotchModel.shared.flash(.focus(state.active), seconds: 2.5)
                 }
             }

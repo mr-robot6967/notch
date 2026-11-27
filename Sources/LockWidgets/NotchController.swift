@@ -283,19 +283,36 @@ final class VolumeMonitor {
         MainActor.assumeIsolated { self?.attach() }
     }
 
+    /// Headphones in/out of the jack switch the built-in device's data source (same device ID), and
+    /// the new route reports its own volume: re-baseline instead of treating it as a user change.
+    private lazy var sourceBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        MainActor.assumeIsolated { self?.attach() }
+    }
+    private var wakeObserver: NSObjectProtocol?
+
     func start() {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
                                                  mScope: kAudioObjectPropertyScopeGlobal,
                                                  mElement: kAudioObjectPropertyElementMain)
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, defaultBlock)
         attach()
+        // After sleep the audio devices are re-enumerated and report their volume again (and a
+        // device can come back with a new ID); re-attach so that is a baseline, not a pop-up.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.attach() }
+        }
     }
 
     private func attach() {
         for var address in registered {
-            AudioObjectRemovePropertyListenerBlock(device, &address, .main, deviceBlock)
+            let block = address.mSelector == kAudioDevicePropertyDataSource ? sourceBlock : deviceBlock
+            AudioObjectRemovePropertyListenerBlock(device, &address, .main, block)
         }
         registered.removeAll()
+        // Until the new device is known, swallow changes (a failed lookup below used to leave the
+        // monitor detached for good; now the next default-device/wake callback re-attaches).
+        attachedAt = Date()
 
         var id = AudioObjectID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
@@ -314,6 +331,12 @@ final class VolumeMonitor {
                     break
                 }
             }
+        }
+        var source = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDataSource,
+                                                mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectHasProperty(device, &source) {
+            AudioObjectAddPropertyListenerBlock(device, &source, .main, sourceBlock)
+            registered.append(source)
         }
         // Baseline, so switching devices doesn't pop the HUD.
         (lastVolume, lastMuted) = read()
@@ -354,10 +377,20 @@ final class BluetoothConnectMonitor: NSObject {
     private var notification: IOBluetoothUserNotification?
     private var startedAt = Date()
 
+    private var wakeObserver: NSObjectProtocol?
+
     func start() {
         startedAt = Date()
         notification = IOBluetoothDevice.register(forConnectNotifications: self,
                                                   selector: #selector(connected(_:device:)))
+        // Keyboards, mice and trackpads reconnect by themselves after sleep; that isn't the user
+        // connecting something, so the same "already connected" grace applies after wake.
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.startedAt = Date()
+            }
+        }
     }
 
     @objc private func connected(_ note: IOBluetoothUserNotification, device: IOBluetoothDevice) {
@@ -474,7 +507,8 @@ final class NotchController {
 
         volume.onChange = { level, muted in
             // Not from the keys and a status just appeared (e.g. AirPods connecting): don't cover it.
-            if Date().timeIntervalSince(MediaKeyTap.lastVolumeKeyAt) > 0.6, NotchModel.shared.statusIsFresh() { return }
+            // (3 s: AirPods report their own volume a couple of seconds after the "connected" status.)
+            if Date().timeIntervalSince(MediaKeyTap.lastVolumeKeyAt) > 0.6, NotchModel.shared.statusIsFresh(3) { return }
             NotchModel.shared.flash(.volume(level: level, muted: muted), seconds: 1.6)
             if AppSettings.shared.config.notchHaptics && (level <= 0.001 || level >= 0.999 || muted) {
                 NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
@@ -542,6 +576,29 @@ final class NotchController {
             .sink { [weak self] _ in
                 self?.updateFullscreenHiding()
                 withAnimation(IslandMotion.activity) { self?.model.objectWillChange.send() }
+            }
+            .store(in: &cancellables)
+
+        // Going to sleep with the island open (or hovered) left it stuck that way after wake: the
+        // collapse only runs on the next mouse move. Reset the transient UI state on sleep.
+        workspace.publisher(for: NSWorkspace.willSleepNotification)
+            .merge(with: workspace.publisher(for: NSWorkspace.screensDidSleepNotification))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.hoverWork?.cancel(); self.hoverWork = nil
+                self.collapseWork?.cancel(); self.collapseWork = nil
+                if self.model.expanded { self.collapse() }
+                if self.model.hovering { self.model.hovering = false }
+                self.resetScroll()
+            }
+            .store(in: &cancellables)
+        // Re-check fullscreen/Mission Control hiding and geometry after wake (displays may have changed).
+        workspace.publisher(for: NSWorkspace.screensDidWakeNotification)
+            .delay(for: .milliseconds(500), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.reposition()
+                self?.updateFullscreenHiding()
             }
             .store(in: &cancellables)
 
@@ -717,17 +774,62 @@ final class NotchController {
         if info.isPluggedIn || info.level > threshold { warnedLowAt = nil }
     }
 
+    /// Names from IOBluetooth, CoreAudio and system_profiler differ in apostrophes (’ vs ') and case.
+    static func normalizedDeviceName(_ name: String) -> String {
+        name.lowercased()
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func deviceNamesMatch(_ a: String, _ b: String) -> Bool {
+        let x = normalizedDeviceName(a), y = normalizedDeviceName(b)
+        guard !x.isEmpty, !y.isEmpty else { return false }
+        return x == y || x.hasPrefix(y) || y.hasPrefix(x) || x.contains(y) || y.contains(x)
+    }
+
+    /// When each device last announced itself (normalized name), so IOBluetooth and CoreAudio
+    /// reporting the same connection show it once.
+    private var recentConnects: [String: Date] = [:]
+
+    /// Called by the IOBluetooth connect notification and by CoreAudio gaining a Bluetooth output.
     func deviceConnected(_ name: String) {
-        // Give the device a moment to report its battery, then show it.
+        let now = Date()
+        recentConnects = recentConnects.filter { now.timeIntervalSince($0.value) < 10 }
+        guard !recentConnects.keys.contains(where: { Self.deviceNamesMatch($0, name) }) else { return }
+        recentConnects[Self.normalizedDeviceName(name)] = now
+
         store.refreshPeripherals(fullScan: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
-            guard let self else { return }
-            let matches = self.store.peripherals.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
-            let level = matches.filter { $0.component != "Case" }.map(\.level).min() ?? matches.first?.level
-            let symbol = matches.first.map { $0.kind == .earbudLeft || $0.kind == .earbudRight ? "airpodspro" : $0.kind.symbol }
-                ?? DeviceKind.guess(from: name).symbol
-            self.model.flash(.device(name: name, symbol: symbol, level: level), seconds: 4)
+        // Show it straight away (waiting for the battery scan meant the song peek of the resumed
+        // music, or nothing, was all that appeared), then fill in the level once the scan is in.
+        let first = deviceActivity(name)
+        model.flash(first, seconds: 4)
+        for delay in [3.0, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, case .device(let shown, _, let oldLevel) = self.model.transient, shown == name else { return }
+                let updated = self.deviceActivity(name)
+                if case .device(_, _, let level) = updated, level != nil, level != oldLevel {
+                    self.model.flash(updated, seconds: 4)
+                }
+            }
         }
+    }
+
+    private func deviceActivity(_ name: String) -> LiveActivity {
+        let matches = store.peripherals.filter { Self.deviceNamesMatch($0.name, name) }
+        let level = matches.filter { $0.component != "Case" }.map(\.level).min() ?? matches.first?.level
+        // Both buds → the pair icon; one bud → that bud; otherwise the device's own icon.
+        let buds = matches.filter { $0.kind == .earbudLeft || $0.kind == .earbudRight }
+        let pair = name.lowercased().contains("pro") ? "airpodspro" : "airpods"
+        let symbol: String
+        if buds.contains(where: { $0.kind == .earbudLeft }) && buds.contains(where: { $0.kind == .earbudRight }) {
+            symbol = pair
+        } else if let bud = buds.first {
+            symbol = bud.kind.symbol
+        } else {
+            symbol = matches.first?.kind.symbol ?? DeviceKind.guess(from: name).symbol
+        }
+        return .device(name: name, symbol: symbol, level: level)
     }
 
     // MARK: Size

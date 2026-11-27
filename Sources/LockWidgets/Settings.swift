@@ -197,6 +197,8 @@ struct Config: Codable, Equatable {
     var missionControlMigrated: Bool = true
     /// Jiggle the whole island when a song is skipped, and how far (points).
     var skipJiggle: Bool = true
+    /// Show both AirPods as one gauge (lower of the two levels) when both are connected.
+    var combineEarbuds: Bool = true
     var skipJiggleAmount: Double = 18
     /// The first-launch welcome has been completed.
     var onboardingDone: Bool = false

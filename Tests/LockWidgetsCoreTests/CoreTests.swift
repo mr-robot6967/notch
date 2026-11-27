@@ -130,3 +130,19 @@ import Testing
     #expect(ScreenPlacement(x: 0.0, y: 1.0).origin(for: box, in: screen) == CGPoint(x: 0, y: 700))
     #expect(ScreenPlacement(x: -3, y: 9).clamped() == ScreenPlacement(x: 0.02, y: 0.98))
 }
+
+@Test func earbudsCombineWhenBothConnected() {
+    let devices = [
+        DeviceBattery(name: "My AirPods", kind: .earbudLeft, level: 87, component: "L"),
+        DeviceBattery(name: "My AirPods", kind: .earbudRight, level: 84, component: "R"),
+        DeviceBattery(name: "My AirPods", kind: .earbudCase, level: 40, component: "Case"),
+        DeviceBattery(name: "Magic Mouse", kind: .mouse, level: 14),
+    ]
+    let combined = EarbudCombine.combine(devices)
+    #expect(combined.count == 3)
+    #expect(combined[0].kind == .earbuds && combined[0].level == 84 && combined[0].component == nil)
+    #expect(combined.contains { $0.kind == .earbudCase })
+    // A single bud stays on its own.
+    let single = EarbudCombine.combine([DeviceBattery(name: "My AirPods", kind: .earbudLeft, level: 50, component: "L")])
+    #expect(single.count == 1 && single[0].kind == .earbudLeft)
+}

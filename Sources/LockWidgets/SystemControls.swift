@@ -26,9 +26,19 @@ final class AudioDevices: ObservableObject {
         MainActor.assumeIsolated { AudioDevices.shared.refresh() }
     }
 
+    /// UIDs of the Bluetooth outputs seen so far, to notice a new one (AirPods connecting) without
+    /// the Bluetooth permission IOBluetooth's connect notifications need.
+    private var knownBluetooth = Set<String>()
+    /// Devices present at launch and re-enumerated after wake aren't "just connected".
+    private var ignoreNewUntil = Date().addingTimeInterval(5)
+
     func start() {
         guard !listening else { return }
         listening = true
+        ignoreNewUntil = Date().addingTimeInterval(5)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AudioDevices.shared.ignoreNewUntil = Date().addingTimeInterval(5) }
+        }
         refresh()
         for selector in [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultOutputDevice] {
             var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
@@ -40,7 +50,9 @@ final class AudioDevices: ObservableObject {
     }
 
     func refresh() {
+        let previousID = currentID
         currentID = Self.defaultOutput()
+        if previousID != kAudioObjectUnknown, previousID != currentID { BrightnessWatcher.shared.audioRouteChanged() }
         watchDataSource(of: currentID)
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal,
                                                  mElement: kAudioObjectPropertyElementMain)
@@ -60,6 +72,41 @@ final class AudioDevices: ObservableObject {
             }
             return Device(id: id, name: name, symbol: Self.symbol(for: id, name: name))
         }
+        noticeNewBluetoothOutputs(ids.filter(Self.hasOutput))
+    }
+
+    private func noticeNewBluetoothOutputs(_ ids: [AudioObjectID]) {
+        var current = Set<String>()
+        var added: [String] = []
+        for id in ids {
+            let transport = Self.transport(of: id)
+            guard transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE,
+                  let uid = Self.uid(of: id) else { continue }
+            current.insert(uid)
+            if !knownBluetooth.contains(uid), let name = Self.name(of: id) { added.append(name) }
+        }
+        knownBluetooth = current
+        guard Date() >= ignoreNewUntil else { return }
+        // NotchController dedupes against the IOBluetooth notification for the same device.
+        for name in added { AppDelegate.shared?.notch?.deviceConnected(name) }
+    }
+
+    private static func transport(of id: AudioObjectID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        AudioObjectGetPropertyData(id, &address, 0, nil, &size, &transport)
+        return transport
+    }
+
+    private static func uid(of id: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &uid) == noErr, let value = uid?.takeRetainedValue() else { return nil }
+        return value as String
     }
 
     func select(_ device: Device) {
@@ -211,7 +258,8 @@ final class AudioDevices: ObservableObject {
         if lower.contains("airpods") { return "airpods" }
         switch transport {
         // Desktop Macs (no internal battery) have built-in speakers too; don't draw a laptop for them.
-        case kAudioDeviceTransportTypeBuiltIn: return MacBattery.read() == nil ? "desktopcomputer" : "laptopcomputer"
+        case kAudioDeviceTransportTypeBuiltIn: // (a nil IOPS reading during wake is transient; the store keeps the last one)
+            return WidgetStore.shared.mac == nil && MacBattery.read() == nil ? "desktopcomputer" : "laptopcomputer"
         case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return "headphones"
         case kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeDisplayPort: return "tv"
         case kAudioDeviceTransportTypeAirPlay: return "airplayaudio"
@@ -256,9 +304,17 @@ enum Brightness {
     }
 
     /// Calls back on every brightness change (keys, Control Center, ambient light…).
-    static func observe() {
+    /// The display the change notifications are registered for. Launching in clamshell mode (or with
+    /// the built-in panel off) registered for the external screen only, and opening the lid never
+    /// re-registered, so the brightness HUD stayed dead until relaunch.
+    @MainActor private static var registeredDisplays = Swift.Set<CGDirectDisplayID>()
+
+    @MainActor static func observe() {
         guard let registerFn else { return }
-        let result = registerFn(display, nil) { _, _, _, _, _ in
+        let target = display
+        guard !registeredDisplays.contains(target) else { return }
+        registeredDisplays.insert(target)
+        let result = registerFn(target, nil) { _, _, _, _, _ in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { BrightnessWatcher.shared.changed() }
             }
@@ -278,12 +334,33 @@ final class BrightnessWatcher {
     private var ignoreAutomaticUntil = Date.distantPast
 
     func powerSourceChanged() {
-        ignoreAutomaticUntil = Date().addingTimeInterval(5)
+        ignoreAutomatic(for: 5)
     }
 
     func start() {
         last = Brightness.get() ?? -1
         Brightness.observe()
+        // Register for the built-in panel once it appears (lid opened, display reconnected).
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                Brightness.observe()
+                BrightnessWatcher.shared.ignoreAutomatic(for: 3)
+            }
+        }
+        // The display ramps its brightness down when it sleeps (and the idle dim before that) and
+        // back up on wake; those automatic changes are not the user pressing a key.
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { BrightnessWatcher.shared.ignoreAutomatic(for: 5) }
+            }
+        }
+    }
+
+    private func ignoreAutomatic(for seconds: TimeInterval) {
+        ignoreAutomaticUntil = max(ignoreAutomaticUntil, Date().addingTimeInterval(seconds))
     }
 
     /// Called by the media-key tap so key presses always show the HUD immediately.
@@ -293,12 +370,30 @@ final class BrightnessWatcher {
         NotchModel.shared.flash(.brightness(level: value), seconds: 1.6)
     }
 
+    /// When the previous brightness notification arrived (to tell a key step from a ramp).
+    private var lastNotificationAt = Date.distantPast
+
+    /// The default audio output switched (AirPods out of the ears, headphones…): auto-brightness
+    /// adjustments around that moment showed a "Display" pop-up nobody asked for.
+    func audioRouteChanged() { ignoreAutomatic(for: 3) }
+
     fileprivate func changed() {
         guard let value = Brightness.get() else { return }
-        // Auto-brightness makes small changes all the time; only show clear, user-sized steps.
-        guard abs(value - last) >= 0.03, Date().timeIntervalSince(lastUserChange) > 0.3 else { return }
+        let now = Date()
+        let delta = abs(value - last)
+        let stableFor = now.timeIntervalSince(lastNotificationAt)
+        lastNotificationAt = now
+        // Running baseline: every reading moves it, so a slow auto-brightness ramp (many small
+        // notifications) can never add up to a pop-up. (It used to compare against the last *shown*
+        // level, so drift accumulated until it crossed the threshold.)
         last = value
-        guard Date() >= ignoreAutomaticUntil else { return }
+        guard now.timeIntervalSince(lastUserChange) > 0.3, now >= ignoreAutomaticUntil else { return }
+        // A brightness key (without the key tap) is one discrete step of 1/16 (1/64 with ⌥⇧, ~0.016)
+        // arriving after the level was still; automatic changes come as small increments in quick
+        // succession. Fine ⌥⇧ steps are below this threshold and so only show through the key tap.
+        // While a brightness HUD is already up, further key steps (held key) update it.
+        let hudUp: Bool = { if case .brightness = NotchModel.shared.transient { return true } else { return false } }()
+        guard delta >= 0.05, stableFor >= 0.4 || hudUp else { return }
         // A change not made with the keys never covers another status (charging, device, song…).
         if let current = NotchModel.shared.transient {
             if case .brightness = current {} else { return }

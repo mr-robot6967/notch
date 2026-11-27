@@ -12,6 +12,7 @@ final class Extras {
     private var chimeTimer: Timer?
     private var peekTimer: Timer?
     private var peeked = Set<String>()
+    private var lastLowPower = false
     private var cancellables = Set<AnyCancellable>()
 
     func start() {
@@ -25,7 +26,10 @@ final class Extras {
             .sink { [weak self] on in self?.scheduleChime(on) }
             .store(in: &cancellables)
         // Timers drift while asleep; re-align the chime to the hour after wake.
+        // (Also after the clock or time zone changes, which would leave it off the hour.)
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .merge(with: NotificationCenter.default.publisher(for: .NSSystemClockDidChange))
+            .merge(with: NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange))
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleChime(AppSettings.shared.config.hourlyChime) }
             .store(in: &cancellables)
@@ -38,11 +42,21 @@ final class Extras {
         RunLoop.main.add(peek, forMode: .common)
         peekTimer = peek
 
+        lastLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
         NotificationCenter.default.publisher(for: Notification.Name.NSProcessInfoPowerStateDidChange)
             .receive(on: RunLoop.main)
-            .sink { _ in
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // The notification is also posted without Low Power Mode changing (other power-state
+                // updates, wake); only an actual change is news.
+                let on = ProcessInfo.processInfo.isLowPowerModeEnabled
+                guard on != self.lastLowPower else { return }
+                self.lastLowPower = on
                 guard AppSettings.shared.config.lowPowerActivity else { return }
-                NotchModel.shared.flash(.lowPower(ProcessInfo.processInfo.isLowPowerModeEnabled), seconds: 3)
+                // "Low Power Mode: only on battery" switches it as a consequence of (un)plugging the
+                // charger; that automatic change must not replace the charging status just shown.
+                if case .charging = NotchModel.shared.transient, NotchModel.shared.statusIsFresh(3) { return }
+                NotchModel.shared.flash(.lowPower(on), seconds: 3)
             }
             .store(in: &cancellables)
 
@@ -70,6 +84,10 @@ final class Extras {
         let timer = Timer(fire: nextHour, interval: 3600, repeats: true) { _ in
             MainActor.assumeIsolated {
                 guard !NotchModel.shared.locked else { return }
+                // A repeating timer whose fire date passed during sleep fires once on wake, at a random
+                // minute (before the wake handler re-aligns it). Only chime on the hour.
+                let minute = Calendar.current.component(.minute, from: Date())
+                guard minute == 0 || minute == 59 else { return }
                 SystemSounds.play("Purr")
             }
         }

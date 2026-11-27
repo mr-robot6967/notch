@@ -82,7 +82,7 @@ public struct WidgetEntry: Codable, Identifiable, Hashable, Sendable {
 }
 
 public enum DeviceKind: String, Codable, Sendable {
-    case mouse, keyboard, trackpad, headphones, earbudLeft, earbudRight, earbudCase, speaker, gamepad, other
+    case mouse, keyboard, trackpad, headphones, earbudLeft, earbudRight, earbudCase, earbuds, speaker, gamepad, other
 
     public var symbol: String {
         switch self {
@@ -93,6 +93,7 @@ public enum DeviceKind: String, Codable, Sendable {
         case .earbudLeft: return "airpod.left"
         case .earbudRight: return "airpod.right"
         case .earbudCase: return "airpods.chargingcase.fill"
+        case .earbuds: return "airpods"
         case .speaker: return "hifispeaker.fill"
         case .gamepad: return "gamecontroller.fill"
         case .other: return "dot.radiowaves.left.and.right"
@@ -147,6 +148,36 @@ public enum PeripheralMerge {
             result.append(device)
         }
         return result.sorted { ($0.name, $0.component ?? "") < ($1.name, $1.component ?? "") }
+    }
+}
+
+public enum EarbudCombine {
+    /// When both earbuds of the same pair are connected, show them as one "earbuds" entry at the
+    /// lower of the two levels (so the gauge never overstates); the case and single buds stay as
+    /// they are. Order is preserved (the pair takes the left bud's place).
+    public static func combine(_ devices: [DeviceBattery]) -> [DeviceBattery] {
+        var result: [DeviceBattery] = []
+        var handled = Set<String>()
+        for device in devices {
+            guard device.kind == .earbudLeft || device.kind == .earbudRight else {
+                result.append(device)
+                continue
+            }
+            let key = device.name.lowercased()
+            if handled.contains(key) { continue }
+            let pair = devices.filter { $0.name.lowercased() == key && ($0.kind == .earbudLeft || $0.kind == .earbudRight) }
+            if pair.contains(where: { $0.kind == .earbudLeft }), pair.contains(where: { $0.kind == .earbudRight }) {
+                handled.insert(key)
+                var both = DeviceBattery(name: device.name, kind: .earbuds,
+                                         level: pair.map(\.level).min() ?? device.level,
+                                         isCharging: pair.allSatisfy(\.isCharging), component: nil)
+                both.id = device.name + "#both"
+                result.append(both)
+            } else {
+                result.append(device)
+            }
+        }
+        return result
     }
 }
 

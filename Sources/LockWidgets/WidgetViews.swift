@@ -323,6 +323,12 @@ struct GlassBackground<S: Shape>: View {
     private var finish: String { settings.config.glassFinish }
     private var strength: Double { settings.config.glassStrength }
 
+    private func cornerRadius(for size: CGSize) -> CGFloat {
+        if shape is Circle { return min(size.width, size.height) / 2 }
+        if let rounded = shape as? RoundedRectangle { return rounded.cornerSize.width }
+        return 16
+    }
+
     var body: some View {
         if baked {
             shape.fill(theme.glyph.opacity(0.10))
@@ -332,11 +338,15 @@ struct GlassBackground<S: Shape>: View {
         } else if finish == "light" {
             shape.fill(Color.white.opacity(0.2 + 0.6 * strength)).overlay(shape.stroke(Color.white.opacity(0.6), lineWidth: 0.8))
         } else if #available(macOS 26.0, *) {
-            switch finish {
-            case "regular": Color.clear.glassEffect(.regular, in: shape)
-            case "tinted": Color.clear.glassEffect(.regular.tint(theme.accent.opacity(0.4)), in: shape)
-            default: Color.clear.glassEffect(.clear, in: shape)
+            // AppKit's glass view is composited by the window server against what is really behind
+            // the window (the lock-screen wallpaper, live wallpapers included), so it has proper
+            // depth and refraction; SwiftUI's glass in this separate window rendered flat.
+            GeometryReader { geo in
+                NativeGlass(cornerRadius: cornerRadius(for: geo.size),
+                            style: finish == "regular" || finish == "tinted" ? .regular : .clear,
+                            tint: finish == "tinted" ? NSColor(theme.accent.opacity(0.45)) : nil)
             }
+            .clipShape(shape)
         } else {
             shape.fill(.ultraThinMaterial)
                 .overlay(shape.stroke(Color.white.opacity(0.18), lineWidth: 0.8))
@@ -1097,5 +1107,28 @@ struct BakedWallpaperView: View {
         }
         .frame(width: size.width, height: size.height)
         .environment(\.bakedRendering, true)
+    }
+}
+
+/// Wraps NSGlassEffectView (macOS 26+): real Liquid Glass drawn by the window server.
+@available(macOS 26.0, *)
+struct NativeGlass: NSViewRepresentable {
+    var cornerRadius: CGFloat
+    var style: NSGlassEffectView.Style
+    var tint: NSColor?
+
+    func makeNSView(context: Context) -> NSGlassEffectView {
+        let view = NSGlassEffectView()
+        view.contentView = NSView()
+        update(view)
+        return view
+    }
+
+    func updateNSView(_ view: NSGlassEffectView, context: Context) { update(view) }
+
+    private func update(_ view: NSGlassEffectView) {
+        if view.cornerRadius != cornerRadius { view.cornerRadius = cornerRadius }
+        if view.style != style { view.style = style }
+        view.tintColor = tint
     }
 }

@@ -131,6 +131,45 @@ final class DiscordPresence: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleUpdate() }
             .store(in: &cancellables)
+
+        // Updates are only sent when the song changes, so a Discord restart (or the socket dying
+        // over sleep) left the status blank until the next track; and a failed send was never
+        // retried. Reconnect when Discord launches (its IPC socket takes a few seconds to appear)
+        // and after wake; forget the dead socket when it quits.
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.publisher(for: NSWorkspace.didLaunchApplicationNotification)
+            .filter { Self.isDiscord($0) }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                for delay in [5.0, 20.0] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self?.reconnectIfEnabled() }
+                }
+            }
+            .store(in: &cancellables)
+        workspace.publisher(for: NSWorkspace.didTerminateApplicationNotification)
+            .filter { Self.isDiscord($0) }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.lastSent = nil
+                self.queue.async { [ipc = self.ipc] in ipc.close() }
+            }
+            .store(in: &cancellables)
+        workspace.publisher(for: NSWorkspace.didWakeNotification)
+            .delay(for: .seconds(5), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.reconnectIfEnabled() }
+            .store(in: &cancellables)
+    }
+
+    private static func isDiscord(_ note: Notification) -> Bool {
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        return app?.bundleIdentifier?.hasPrefix("com.hnc.Discord") == true // Discord, PTB, Canary
+    }
+
+    private func reconnectIfEnabled() {
+        let cfg = AppSettings.shared.config
+        guard cfg.discordEnabled, !cfg.discordClientID.isEmpty else { return }
+        reconnect()
     }
 
     /// Discord asks clients not to update presence more than about every 15 s.

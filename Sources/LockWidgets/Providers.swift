@@ -42,11 +42,15 @@ enum MacBattery {
                 (desc[kIOPSTypeKey] as? String) == kIOPSInternalBatteryType
             else { continue }
 
-            let current = desc[kIOPSCurrentCapacityKey] as? Int ?? 0
+            // While the Mac wakes, IOPS can briefly describe the battery without its capacity or power
+            // state. Defaulting those to 0 % / "on battery" fired a false low-battery warning (with
+            // sound) and an unplugged → charging pop-up pair. An incomplete reading is no reading.
+            guard let current = desc[kIOPSCurrentCapacityKey] as? Int,
+                  let state = desc[kIOPSPowerSourceStateKey] as? String else { return nil }
             let maximum = desc[kIOPSMaxCapacityKey] as? Int ?? 100
             let level = maximum > 0 ? Int((Double(current) / Double(maximum) * 100).rounded()) : current
             let charging = desc[kIOPSIsChargingKey] as? Bool ?? false
-            let pluggedIn = (desc[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
+            let pluggedIn = state == kIOPSACPowerValue
             let minutes = desc[charging ? kIOPSTimeToFullChargeKey : kIOPSTimeToEmptyKey] as? Int ?? -1
             return MacBatteryInfo(
                 level: level,
@@ -92,21 +96,23 @@ enum HIDBatteries {
 // MARK: - AirPods, Beats and other Bluetooth devices via system_profiler
 
 enum BluetoothBatteries {
-    static func read() -> [DeviceBattery] {
+    /// nil when system_profiler failed or timed out (so callers keep the last good list instead of
+    /// making every AirPods/Beats gauge vanish until the next scan).
+    static func read() -> [DeviceBattery]? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
         process.arguments = ["SPBluetoothDataType", "-json"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return [] }
+        do { try process.run() } catch { return nil }
         // Bluetooth trouble can make system_profiler hang; never wait more than 15 s.
         let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         watchdog.cancel()
-        guard process.terminationStatus == 0 else { return [] }
+        guard process.terminationStatus == 0, !data.isEmpty else { return nil }
         return BluetoothParser.parse(data)
     }
 }
@@ -205,6 +211,10 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 final class WeatherService {
     private let location = LocationProvider()
     private var geocodeCache: [String: GeoPlace] = [:]
+    /// The last real location fix. Right after wake (or offline) CoreLocation often times out or
+    /// fails once; falling back to the time-zone city then replaced your weather with another
+    /// city's. A transient failure reuses the last fix; only "denied" uses the time-zone city.
+    private var lastFix: (latitude: Double, longitude: Double, name: String)?
 
     /// "Europe/London" → "London", "America/New_York" → "New York".
     static var timeZoneCity: String? {
@@ -242,7 +252,14 @@ final class WeatherService {
                 let loc = try await location.currentLocation()
                 latitude = loc.coordinate.latitude
                 longitude = loc.coordinate.longitude
-                name = await location.placeName(for: loc) ?? "Current Location"
+                // Reverse geocoding needs the network; keep the last name for the same place.
+                let sameSpot = lastFix.map { abs($0.latitude - latitude) < 0.05 && abs($0.longitude - longitude) < 0.05 } ?? false
+                name = await location.placeName(for: loc) ?? (sameSpot ? lastFix?.name : nil) ?? "Current Location"
+                lastFix = (latitude, longitude, name)
+            } catch let error as LocationError where error != .denied && lastFix != nil {
+                latitude = lastFix!.latitude
+                longitude = lastFix!.longitude
+                name = lastFix!.name
             } catch {
                 // No location permission/fix: use the city from the Mac's time-zone setting
                 // (e.g. Asia/Kolkata → Kolkata) so the widget still shows local weather.

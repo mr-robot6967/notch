@@ -3,6 +3,7 @@ import Combine
 import EventKit
 import ImageIO
 import IOKit.ps
+import Network
 import SwiftUI
 import LockWidgetsCore
 
@@ -158,9 +159,36 @@ final class WidgetStore: ObservableObject {
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
+            .sink { _ in WidgetStore.shared.displaysAsleep = false } // never stay paused if screensDidWake is missed
+            .store(in: &cancellables)
+        NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.didWakeNotification)
+            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidBecomeActiveNotification))
             .delay(for: .seconds(3), scheduler: RunLoop.main)
             .sink { _ in WidgetStore.shared.refreshAll() }
             .store(in: &cancellables)
+
+        // The refresh 3 s after wake usually runs before Wi-Fi is back, and a failed weather fetch
+        // then waited for the 2-minute timer (or stayed "No weather" from a cold offline launch).
+        // Refetch the moment the network returns, if what we have is missing, failed or stale.
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { path in
+            let online = path.status == .satisfied
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { WidgetStore.shared.networkChanged(online: online) }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "LockWidgets.network", qos: .utility))
+        pathMonitor = monitor
+    }
+
+    private var pathMonitor: NWPathMonitor?
+    private var wasOnline: Bool?
+
+    private func networkChanged(online: Bool) {
+        defer { wasOnline = online }
+        guard online, wasOnline == false else { return }
+        if weather == nil || weatherStatus != nil { refreshWeather() } else { refreshWeatherIfStale() }
     }
 
     func refreshAll() {
@@ -248,14 +276,29 @@ final class WidgetStore: ObservableObject {
     // MARK: Data
 
     func refreshMac() {
-        let info = MacBattery.read()
+        // A Mac's internal battery doesn't disappear: a nil/incomplete reading (IOPS during wake) is
+        // transient, so keep the last good value and look again shortly instead of blanking the gauge.
+        guard let info = MacBattery.read() else {
+            if mac != nil, !macRetryScheduled {
+                macRetryScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    WidgetStore.shared.macRetryScheduled = false
+                    WidgetStore.shared.refreshMac()
+                }
+            }
+            return
+        }
         if info != mac { mac = info }
     }
+
+    private var macRetryScheduled = false
 
     private func addTimer(every seconds: TimeInterval, _ work: @escaping (WidgetStore) -> Void) {
         let timer = Timer(timeInterval: seconds, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let store = WidgetStore.shared
+                // Ask the display itself: a missed screensDidWake must not pause every refresh for good.
+                if store.displaysAsleep, CGDisplayIsAsleep(CGMainDisplayID()) == 0 { store.displaysAsleep = false }
                 guard !store.displaysAsleep else { return }
                 work(store)
             }
@@ -281,7 +324,7 @@ final class WidgetStore: ObservableObject {
         peripheralsInFlight = true
         let previousBluetooth = lastBluetooth
         DispatchQueue.global(qos: .utility).async {
-            let bluetooth = fullScan ? BluetoothBatteries.read() : previousBluetooth
+            let bluetooth = fullScan ? (BluetoothBatteries.read() ?? previousBluetooth) : previousBluetooth
             let merged = PeripheralMerge.merge(hid: HIDBatteries.read(), bluetooth: bluetooth)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -315,8 +358,15 @@ final class WidgetStore: ObservableObject {
         let config = settings.config
         Task { @MainActor in
             do {
-                let snapshot = try await self.weatherService.fetch(config: config)
+                var snapshot = try await self.weatherService.fetch(config: config)
                 guard generation == self.weatherGeneration else { return }
+                // Air quality is a separate, optional request; one failed fetch (network still
+                // waking) used to blank the AQI until the next refresh. Keep the last value for the
+                // same place for a while.
+                if snapshot.airQuality == nil, let old = self.weather, old.airQuality != nil,
+                   old.locationName == snapshot.locationName, Date().timeIntervalSince(old.fetchedAt) < 3 * 3600 {
+                    snapshot.airQuality = old.airQuality
+                }
                 self.weather = snapshot
                 self.weatherStatus = nil
             } catch {
@@ -371,6 +421,8 @@ final class WidgetStore: ObservableObject {
 
     func visiblePeripherals(hidden: [String]) -> [DeviceBattery] {
         let hiddenSet = Set(hidden)
-        return peripherals.filter { !hiddenSet.contains($0.id) }
+        let visible = peripherals.filter { !hiddenSet.contains($0.id) }
+        // Both buds in: one AirPods gauge, like Apple's Batteries widget (case stays separate).
+        return AppSettings.shared.config.combineEarbuds ? EarbudCombine.combine(visible) : visible
     }
 }
