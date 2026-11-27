@@ -1120,7 +1120,7 @@ private struct NotchSettingsTab: View {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
                     tryButton("Volume", "speaker.wave.2.fill") { NotchModel.shared.flash(.volume(level: 0.62, muted: false), seconds: 2) }
                     tryButton("Brightness", "sun.max.fill") { NotchModel.shared.flash(.brightness(level: 0.45), seconds: 2) }
-                    tryButton("Charging", "bolt.fill") { NotchModel.shared.flash(.charging(level: WidgetStore.shared.mac?.level ?? 80, pluggedIn: true)) }
+                    tryButton("Charging", "bolt.fill") { NotchModel.shared.flash(.charging(level: WidgetStore.shared.mac?.level ?? 80, state: WidgetStore.shared.mac?.chargeState ?? .charging)) }
                     tryButton("Song change", "music.note") {
                         let info = MediaController.shared.info
                         NotchModel.shared.flash(.songChange(title: info?.displayTitle ?? "Song title", artist: info?.artist ?? "Artist"), seconds: 3)

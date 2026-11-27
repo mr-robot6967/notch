@@ -8,11 +8,25 @@ import LockWidgetsCore
 
 // MARK: - Mac battery (IOKit power sources)
 
+/// What macOS shows for the battery: charging, charging on hold (Optimized Battery Charging or
+/// another pause while plugged in), fully charged, or running on battery.
+enum ChargeState: Equatable {
+    case charging, onHold, charged, onBattery
+}
+
 struct MacBatteryInfo: Equatable {
     var level: Int
     var isCharging: Bool
     var isPluggedIn: Bool
     var minutesRemaining: Int?
+    var isCharged: Bool = false
+
+    var chargeState: ChargeState {
+        if !isPluggedIn { return .onBattery }
+        if isCharging { return .charging }
+        if isCharged || level >= 100 { return .charged }
+        return .onHold
+    }
 }
 
 enum MacBattery {
@@ -38,7 +52,8 @@ enum MacBattery {
                 level: level,
                 isCharging: charging,
                 isPluggedIn: pluggedIn,
-                minutesRemaining: minutes > 0 ? minutes : nil
+                minutesRemaining: minutes > 0 ? minutes : nil,
+                isCharged: desc[kIOPSIsChargedKey] as? Bool ?? false
             )
         }
         return nil

@@ -10,7 +10,7 @@ import LockWidgetsCore
 
 /// Short-lived events shown in the notch.
 enum LiveActivity: Equatable {
-    case charging(level: Int, pluggedIn: Bool)
+    case charging(level: Int, state: ChargeState)
     case lowBattery(level: Int)
     case device(name: String, symbol: String, level: Int?)
     case volume(level: Float, muted: Bool)
@@ -387,6 +387,8 @@ final class NotchController {
     private var hoverWork: DispatchWorkItem?
     private var collapseWork: DispatchWorkItem?
     private var lastPluggedIn: Bool?
+    private var lastChargeState: ChargeState?
+    private var lastStateFlash = Date.distantPast
     private var warnedLowAt: Int?
     private var scrollX: CGFloat = 0
     private var scrollY: CGFloat = 0
@@ -424,7 +426,8 @@ final class NotchController {
 
         if CommandLine.arguments.contains("--flash-test") {
             // Plays the widest status pop-ups in turn (to check nothing wraps).
-            let samples: [LiveActivity] = [.charging(level: 100, pluggedIn: true), .charging(level: 100, pluggedIn: false),
+            let samples: [LiveActivity] = [.charging(level: 80, state: .onHold), .charging(level: 100, state: .charged),
+                                           .charging(level: 100, state: .onBattery),
                                            .lowPower(true), .focus(true)]
             for (i, sample) in samples.enumerated() {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2 + Double(i) * 2.5) { NotchModel.shared.flash(sample, seconds: 2.3) }
@@ -693,9 +696,17 @@ final class NotchController {
     private func batteryChanged(_ info: MacBatteryInfo) {
         if let last = lastPluggedIn, last != info.isPluggedIn {
             BrightnessWatcher.shared.powerSourceChanged()
-            model.flash(.charging(level: info.level, pluggedIn: info.isPluggedIn))
+            model.flash(.charging(level: info.level, state: info.chargeState))
+            lastStateFlash = Date()
+        } else if info.isPluggedIn, let previous = lastChargeState, previous != info.chargeState,
+                  Date().timeIntervalSince(lastStateFlash) > 30 {
+            // Still plugged in but macOS changed what it's doing: charging went on hold, resumed, or
+            // finished. Rate-limited so a battery hovering at full can't flicker the island.
+            model.flash(.charging(level: info.level, state: info.chargeState))
+            lastStateFlash = Date()
         }
         lastPluggedIn = info.isPluggedIn
+        lastChargeState = info.chargeState
         let threshold = settings.config.lowBatteryThreshold
         if !info.isPluggedIn, info.level <= threshold, warnedLowAt == nil || info.level <= (warnedLowAt ?? 0) - 10 {
             warnedLowAt = info.level
@@ -739,7 +750,8 @@ final class NotchController {
         case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * k, height: g.height)
         case .device: return CGSize(width: g.width + 2 * 82 * k, height: g.height)
         case .transient(.event): return CGSize(width: g.width + 2 * 110 * k, height: g.height)
-        case .transient(.charging): return CGSize(width: g.width + 2 * 74 * k, height: g.height)
+        case .transient(.charging(_, let state)):
+            return CGSize(width: g.width + 2 * (state == .onHold || state == .charged ? 112 : 74) * k, height: g.height)
         case .transient(.lowPower): return CGSize(width: g.width + 2 * 80 * k, height: g.height)
         case .transient(.focus): return CGSize(width: g.width + 2 * 64 * k, height: g.height)
         case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * k, height: g.height)

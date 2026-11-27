@@ -341,8 +341,13 @@ private struct CompactActivity: View {
             }
         case .transient(.unlocked):
             UnlockGlyph(size: height * 0.27)
-        case .transient(.charging(_, let plugged)):
-            Image(systemName: plugged ? "bolt.fill" : SFSymbol.unpluggedPlug).foregroundStyle(plugged ? .green : .white)
+        case .transient(.charging(_, let state)):
+            switch state {
+            case .charging: Image(systemName: "bolt.fill").foregroundStyle(.green)
+            case .onHold: Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+            case .charged: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .onBattery: Image(systemName: SFSymbol.unpluggedPlug).foregroundStyle(.white)
+            }
         case .transient(.lowBattery):
             Image(systemName: "battery.25percent").foregroundStyle(.red)
         case .transient(.event(_, _, let colorHex)):
@@ -392,11 +397,17 @@ private struct CompactActivity: View {
             }
         case .locked:
             EmptyView()
-        case .transient(.charging(let level, let plugged)):
+        case .transient(.charging(let level, let state)):
             HStack(spacing: 5) {
+                if state == .onHold {
+                    Text("On Hold").foregroundStyle(.orange).lineLimit(1)
+                } else if state == .charged {
+                    Text("Charged").foregroundStyle(.green).lineLimit(1)
+                }
                 Text("\(level)%").monospacedDigit().lineLimit(1)
+                    .foregroundStyle(state == .onHold || state == .charged ? .white.opacity(0.7) : .white)
                 Image(systemName: BatteryLook.symbol(for: level, charging: false))
-                    .foregroundStyle(plugged ? .green : (level < 20 ? .red : .white))
+                    .foregroundStyle(state == .onBattery ? (level < 20 ? .red : .white) : (state == .onHold ? .orange : .green))
             }
             .fixedSize()
         case .transient(.lowBattery(let level)):

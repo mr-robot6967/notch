@@ -748,7 +748,7 @@ struct MacBatteryWidget: View {
             ? b.minutesRemaining.map { String(format: "%d:%02d", $0 / 60, $0 % 60) }
             : nil
         if b.isCharging { return time.map { "Charging · \($0) to full" } ?? "Charging" }
-        if b.isPluggedIn { return "Plugged in · Not charging" }
+        if b.isPluggedIn { return b.chargeState == .charged ? "Fully charged" : "Charging on hold" }
         return time.map { "On battery · \($0) left" } ?? "On battery"
     }
 }
