@@ -322,6 +322,7 @@ struct GlassBackground<S: Shape>: View {
     @EnvironmentObject private var settings: AppSettings
     private var finish: String { settings.config.glassFinish }
     private var strength: Double { settings.config.glassStrength }
+    @Environment(\.uiScale) private var k
 
     private func cornerRadius(for size: CGSize) -> CGFloat {
         if shape is Circle { return min(size.width, size.height) / 2 }
@@ -341,12 +342,25 @@ struct GlassBackground<S: Shape>: View {
             // AppKit's glass view is composited by the window server against what is really behind
             // the window (the lock-screen wallpaper, live wallpapers included), so it has proper
             // depth and refraction; SwiftUI's glass in this separate window rendered flat.
-            GeometryReader { geo in
-                NativeGlass(cornerRadius: cornerRadius(for: geo.size),
-                            style: finish == "regular" || finish == "tinted" ? .regular : .clear,
-                            tint: finish == "tinted" ? NSColor(theme.accent.opacity(0.45)) : nil)
+            ZStack {
+                // Soft shadow only outside the shape (cut out inside so the glass isn't darkened):
+                // lifts the circle off the wallpaper.
+                ZStack {
+                    shape.fill(Color.black).shadow(color: .black.opacity(0.38), radius: 12 * k, y: 6 * k)
+                    shape.fill(Color.black).blendMode(.destinationOut)
+                }
+                .compositingGroup()
+                GeometryReader { geo in
+                    NativeGlass(cornerRadius: cornerRadius(for: geo.size),
+                                style: finish == "regular" || finish == "tinted" ? .regular : .clear,
+                                tint: finish == "tinted" ? NSColor(theme.accent.opacity(0.45)) : nil)
+                }
+                .clipShape(shape)
+                // Light from above, a touch of shade below: reads as a rounded lens, not a flat disc.
+                shape.fill(LinearGradient(colors: [.white.opacity(0.16), .clear, .black.opacity(0.14)],
+                                          startPoint: .top, endPoint: .bottom))
+                    .allowsHitTesting(false)
             }
-            .clipShape(shape)
         } else {
             shape.fill(.ultraThinMaterial)
                 .overlay(shape.stroke(Color.white.opacity(0.18), lineWidth: 0.8))
