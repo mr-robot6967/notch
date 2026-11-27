@@ -962,8 +962,16 @@ final class NotchController {
     private func batteryChanged(_ info: MacBatteryInfo) {
         if let last = lastPluggedIn, last != info.isPluggedIn {
             BrightnessWatcher.shared.powerSourceChanged()
-            model.flash(.charging(level: info.level, state: info.chargeState))
             lastStateFlash = Date()
+            // Give macOS ~2 s to settle (charger negotiation) and show what it's really doing.
+            let plugged = info.isPluggedIn
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self else { return }
+                let settled = MacBattery.read() ?? info
+                guard settled.isPluggedIn == plugged else { return }
+                self.model.flash(.charging(level: settled.level, state: settled.chargeState))
+                self.lastChargeState = settled.chargeState
+            }
         } else if info.isPluggedIn, let previous = lastChargeState, previous != info.chargeState,
                   Date().timeIntervalSince(lastStateFlash) > 30 {
             // Still plugged in but macOS changed what it's doing: charging went on hold, resumed, or
@@ -1062,7 +1070,8 @@ final class NotchController {
         case .device: return CGSize(width: g.width + 2 * 82 * k, height: g.height)
         case .transient(.event): return CGSize(width: g.width + 2 * 110 * k, height: g.height)
         case .transient(.charging(_, let state)):
-            return CGSize(width: g.width + 2 * (state == .onHold || state == .charged ? 112 : 74) * k, height: g.height)
+            // Room for "On Hold 100%" + battery icon on one line.
+            return CGSize(width: g.width + 2 * (state == .onHold || state == .charged ? 128 : 80) * k, height: g.height)
         case .transient(.lowPower): return CGSize(width: g.width + 2 * 80 * k, height: g.height)
         case .transient(.focus): return CGSize(width: g.width + 2 * 64 * k, height: g.height)
         case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * k, height: g.height)

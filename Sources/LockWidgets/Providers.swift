@@ -20,16 +20,58 @@ struct MacBatteryInfo: Equatable {
     var isPluggedIn: Bool
     var minutesRemaining: Int?
     var isCharged: Bool = false
+    /// macOS's reason for not charging while plugged in (0 = none: it's about to charge).
+    var notChargingReason: Int = 0
+    /// The charge limit set in System Settings › Battery (100 when none).
+    var chargeLimit: Int = 100
 
     var chargeState: ChargeState {
         if !isPluggedIn { return .onBattery }
         if isCharging { return .charging }
         if isCharged || level >= 100 { return .charged }
-        return .onHold
+        // Only a real hold counts: macOS gave a reason, or the battery reached the charge limit.
+        // Right after plugging in, macOS briefly reports "not charging" with no reason while the
+        // charger negotiates — that's charging about to start, not "On Hold".
+        if notChargingReason != 0 || level >= chargeLimit - 1 { return .onHold }
+        return .charging
     }
 }
 
 enum MacBattery {
+    /// ChargerData.NotChargingReason from the smart battery (0 when charging or about to).
+    static func notChargingReason() -> Int {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return 0 }
+        defer { IOObjectRelease(service) }
+        guard let data = IORegistryEntryCreateCFProperty(service, "ChargerData" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? [String: Any] else { return 0 }
+        return (data["NotChargingReason"] as? NSNumber)?.intValue ?? 0
+    }
+
+    private static var limitCache: (value: Int, at: Date)?
+
+    /// The charge limit from System Settings › Battery: the power daemon's manual charge-limit
+    /// policy (soclimit), falling back to the Battery settings' stored limit. Cached for a minute.
+    static func chargeLimit() -> Int {
+        if let cached = limitCache, Date().timeIntervalSince(cached.at) < 60 { return cached.value }
+        var limit = 100
+        if let d = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.powerd.charging.plist"),
+           let blob = d["policies"] as? Data,
+           let archive = try? PropertyListSerialization.propertyList(from: blob, format: nil) as? [String: Any],
+           let objects = archive["$objects"] as? [Any] {
+            for case let object as [String: Any] in objects {
+                if let soc = (object["soclimit"] as? NSNumber)?.intValue, soc > 0, soc <= 100 { limit = min(limit, soc) }
+            }
+        }
+        if limit == 100, let ui = UserDefaults(suiteName: "com.apple.batteryui.charging.mac"),
+           let stored = ui.object(forKey: "com.apple.batteryui.charging.mac.prior.limit") as? NSNumber,
+           stored.intValue > 0, stored.intValue < 100 {
+            limit = stored.intValue
+        }
+        limitCache = (limit, Date())
+        return limit
+    }
+
     static func read() -> MacBatteryInfo? {
         guard
             let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
@@ -57,7 +99,9 @@ enum MacBattery {
                 isCharging: charging,
                 isPluggedIn: pluggedIn,
                 minutesRemaining: minutes > 0 ? minutes : nil,
-                isCharged: desc[kIOPSIsChargedKey] as? Bool ?? false
+                isCharged: desc[kIOPSIsChargedKey] as? Bool ?? false,
+                notChargingReason: Self.notChargingReason(),
+                chargeLimit: Self.chargeLimit()
             )
         }
         return nil
