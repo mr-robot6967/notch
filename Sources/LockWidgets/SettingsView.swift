@@ -989,6 +989,7 @@ private struct GeneralTab: View {
                     Button("Show Welcome") { OnboardingController.shared.show() }
                 }
             }
+            UpdatesSection()
             Section("Startup") {
                 Toggle("Launch at login", isOn: Binding(
                     get: { login.enabled },
@@ -1673,6 +1674,48 @@ private struct TimingRow: View {
                 Slider(value: binding, in: range, step: 0.5)
                 Text(String(format: "%.1f s", binding.wrappedValue)).monospacedDigit().frame(width: 46, alignment: .trailing)
             }
+        }
+    }
+}
+
+/// Settings › General › Updates: version, check, install from GitHub.
+private struct UpdatesSection: View {
+    @EnvironmentObject private var settings: AppSettings
+    @ObservedObject private var updater = Updater.shared
+
+    var body: some View {
+        Section("Updates") {
+            LabeledContent("Installed version", value: updater.currentVersion)
+            switch updater.state {
+            case .available(let version):
+                HStack {
+                    Label("Notch \(version) is available", systemImage: "arrow.down.circle.fill").foregroundStyle(.blue)
+                    Spacer()
+                    Button("Update Now") { updater.install() }.buttonStyle(.borderedProminent)
+                }
+                if !updater.releaseNotes.isEmpty {
+                    ScrollView {
+                        Text(updater.releaseNotes).font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 120)
+                }
+            case .downloading:
+                HStack { ProgressView().controlSize(.small); Text("Downloading the update…") }
+            case .installing:
+                HStack { ProgressView().controlSize(.small); Text("Installing — Notch will restart…") }
+            case .checking:
+                HStack { ProgressView().controlSize(.small); Text("Checking GitHub…") }
+            case .upToDate:
+                Label("Notch is up to date", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            case .idle:
+                EmptyView()
+            }
+            Toggle("Check for updates automatically", isOn: $settings.config.autoCheckUpdates)
+            Button("Check Now") { updater.check() }
+                .disabled(updater.state == .checking || updater.state == .downloading || updater.state == .installing)
         }
     }
 }

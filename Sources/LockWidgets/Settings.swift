@@ -223,6 +223,8 @@ struct Config: Codable, Equatable {
     var discordClientID: String = ""
     var discordShowArt: Bool = false
     var spotifyClientID: String = ""
+    /// Check GitHub for a newer Notch once a day.
+    var autoCheckUpdates: Bool = true
     /// Also count songs liked from another release (reads the whole Liked Songs list once a day —
     /// many requests, so off by default).
     var spotifyMatchReleases: Bool = false

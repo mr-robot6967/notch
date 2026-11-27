@@ -60,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Extras.shared.start()
         notch = NotchController(settings: settings, store: store)
         desktopWidgets = DesktopWidgetsController(settings: settings, store: store)
+        Updater.shared.start()
         settingsWindow = SettingsWindowController(settings: settings, store: store)
 
         AppActions.shared.openSettings = { [weak self] in self?.settingsWindow?.show() }
@@ -134,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Menu bar
 
-    private enum Tag: Int { case lockScreen = 1 }
+    private enum Tag: Int { case lockScreen = 1, update = 2 }
 
     private func setUpStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -146,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(menuItem("Preview on Lock Screen", #selector(previewLockScreen), key: "p"))
         menu.addItem(.separator())
         menu.addItem(menuItem("Refresh Now", #selector(refresh), key: "r"))
+        menu.addItem(menuItem("Check for Updates…", #selector(updateAction), tag: .update))
         menu.addItem(menuItem("Settings…", #selector(openSettings), key: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -163,12 +165,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.item(withTag: Tag.lockScreen.rawValue)?.state = settings.config.lockScreenWidgets ? .on : .off
+        if case .available(let version) = Updater.shared.state {
+            menu.item(withTag: Tag.update.rawValue)?.title = "Update to \(version)…"
+        } else {
+            menu.item(withTag: Tag.update.rawValue)?.title = "Check for Updates…"
+        }
     }
 
     @objc private func toggleLockScreen() { settings.config.lockScreenWidgets.toggle() }
     @objc private func previewLockScreen() { lockOverlay?.preview() }
     @objc private func refresh() { store.refreshAll(); baker?.bake() }
     @objc private func openSettings() { settingsWindow?.show() }
+    /// "Update to X…" installs; otherwise checks now and shows the result in Settings › General.
+    @objc private func updateAction() {
+        if Updater.shared.updateAvailable {
+            Updater.shared.install()
+        } else {
+            Updater.shared.check()
+            AppActions.shared.openSettingsPage("general")
+        }
+    }
 }
 
 // MARK: - Snapshot mode (used for verification and artwork)
