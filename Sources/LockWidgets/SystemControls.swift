@@ -525,34 +525,23 @@ final class MediaKeyTap {
 /// system's own sound, whenever that setting is on (Shift inverts it, exactly like macOS).
 @MainActor
 enum VolumeFeedback {
+    /// macOS's own volume-change feedback sound (the "pop" you hear when changing the volume) —
+    /// not the alert sound. Played at full sound volume, so its loudness follows the output volume
+    /// that was just set, exactly like macOS.
+    private static let sound: NSSound? = NSSound(contentsOfFile:
+        "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff", byReference: true)
     private static var lastPlayed = Date.distantPast
-    private static var cached: (path: String, sound: NSSound)?
-
-    /// What macOS plays for volume feedback: the alert sound chosen in System Settings › Sound
-    /// (com.apple.sound.beep.sound), at the alert volume. The old built-in "volume" pop is only a
-    /// fallback when no alert sound is set.
-    private static func feedbackSound() -> (NSSound, Float)? {
-        let global = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain) ?? [:]
-        let fallback = "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff"
-        var path = (global["com.apple.sound.beep.sound"] as? String) ?? fallback
-        if !FileManager.default.fileExists(atPath: path) { path = fallback }
-        let volume = Float((global["com.apple.sound.beep.volume"] as? Double) ?? 1)
-        if let cached, cached.path == path { return (cached.sound, volume) }
-        guard let sound = NSSound(contentsOfFile: path, byReference: true) else { return nil }
-        cached = (path, sound)
-        return (sound, volume)
-    }
 
     static func play(shiftHeld: Bool) {
         let global = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain) ?? [:]
         let enabled = (global["com.apple.sound.beep.feedback"] as? NSNumber)?.intValue == 1
         // Shift inverts the setting, exactly like macOS; no sound while muted.
-        guard enabled != shiftHeld, !AudioDevices.isMuted(), let (sound, volume) = feedbackSound() else { return }
+        guard enabled != shiftHeld, !AudioDevices.isMuted(), let sound else { return }
         // Holding the key repeats fast; one sound per ~120 ms, like macOS.
         guard Date().timeIntervalSince(lastPlayed) > 0.12 else { return }
         lastPlayed = Date()
         sound.stop()
-        sound.volume = max(0.05, min(1, volume))
+        sound.volume = 1
         sound.play()
     }
 }
