@@ -426,7 +426,8 @@ final class NotchController {
 
         if CommandLine.arguments.contains("--flash-test") {
             // Plays the widest status pop-ups in turn (to check nothing wraps).
-            let samples: [LiveActivity] = [.charging(level: 80, state: .onHold), .charging(level: 100, state: .charged),
+            let samples: [LiveActivity] = [.volume(level: 0.62, muted: false), .brightness(level: 0.35),
+                                           .charging(level: 80, state: .onHold), .charging(level: 100, state: .charged),
                                            .charging(level: 100, state: .onBattery),
                                            .lowPower(true), .focus(true)]
             for (i, sample) in samples.enumerated() {

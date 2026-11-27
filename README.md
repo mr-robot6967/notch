@@ -10,6 +10,17 @@ On a MacBook with a notch the island fits the notch exactly. On Macs without one
 
 ## Screenshots
 
+**The island**: open player, compact while music plays, and live activities:
+
+<img src="docs/screenshots/island-player.png" width="380">
+
+<img src="docs/screenshots/island-compact.png" width="280">
+
+<img src="docs/screenshots/island-volume.png" width="400">
+<img src="docs/screenshots/island-brightness.png" width="400">
+<img src="docs/screenshots/island-on-hold.png" width="450">
+<img src="docs/screenshots/island-charged.png" width="450">
+
 | Welcome | Settings |
 |---|---|
 | <img src="docs/screenshots/welcome.png" width="300"> | <img src="docs/screenshots/settings.png" width="460"> |
