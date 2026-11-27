@@ -76,8 +76,9 @@ struct NotchRootView: View {
                     controller.expand()
                 }
             }
-            .onDrop(of: [.fileURL], isTargeted: $model.dropTargeted) { providers in
-                loadURLs(providers)
+            // Any kind of item (files, folders, images, links, text), several per drag.
+            .onDrop(of: ShelfModel.acceptedTypes, isTargeted: $model.dropTargeted) { providers in
+                ShelfModel.shared.accept(providers)
                 return true
             }
             Spacer(minLength: 0)
@@ -93,23 +94,6 @@ struct NotchRootView: View {
         case .hud(let kind, _, _): return "hud-\(kind)"
         case .transient(let t): return "t-\(t.settingKey)"
         default: return String(describing: content).prefix(12).description
-        }
-    }
-
-    private func loadURLs(_ providers: [NSItemProvider]) {
-        for provider in providers {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url, url.isFileURL else { return }
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        ShelfModel.shared.add([url])
-                        guard !NotchModel.shared.locked, AppSettings.shared.config.notchExpandMode != .never else { return }
-                        NotchModel.shared.page = .shelf
-                        AppDelegate.shared?.notch?.expand()
-                        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
-                    }
-                }
-            }
         }
     }
 }
@@ -360,6 +344,8 @@ private struct CompactActivity: View {
             if let w = WidgetStore.shared.weather {
                 Image(systemName: w.symbol).symbolRenderingMode(.multicolor).font(.system(size: height * 0.34))
             }
+        case .idleNotPlaying:
+            Image(systemName: "music.note").foregroundStyle(.white.opacity(0.45))
         default:
             EmptyView()
         }
@@ -425,6 +411,8 @@ private struct CompactActivity: View {
             if let w = WidgetStore.shared.weather {
                 Text("\(Int(w.temperature.rounded()))°").monospacedDigit().foregroundStyle(.white.opacity(0.85))
             }
+        case .idleNotPlaying:
+            Text("Not playing").foregroundStyle(.white.opacity(0.55)).lineLimit(1).fixedSize()
         case .transient(.unlocked):
             EmptyView()
         case .transient(.timerDone):
@@ -466,7 +454,7 @@ private struct ExpandedNotch: View {
                         Capsule()
                             .fill(Color.white.opacity(page == model.page ? 0.9 : 0.25))
                             .frame(width: 4, height: page == model.page ? 12 : 4)
-                            .onTapGesture { model.page = page }
+                            .onTapGesture { model.choosePage(page) }
                     }
                 }
                 .padding(.leading, 8)
@@ -617,7 +605,7 @@ private struct NowPlayingPage: View {
         AppDelegate.shared?.notch?.collapse()
     }
 
-    /// The button left of "previous": Like, Shuffle or Repeat (Settings › Notch). Like only appears
+    /// The button left of "previous": Like, Shuffle or Repeat (Settings › Island). Like only appears
     /// where it works (Music/Podcasts, or Spotify once connected); otherwise Shuffle is shown.
     @ViewBuilder private func leftControl(_ info: NowPlayingInfo) -> some View {
         let choice = settings.config.notchLeftControl
@@ -632,7 +620,7 @@ private struct NowPlayingPage: View {
                     if youtube { YTMusicBridge.shared.refresh() } else { AppActions.shared.openSettingsPage("integrations") }
                 }
             }
-            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Integrations to like songs"))
+            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Notifications & Apps to like songs"))
         } else if choice == "repeat" {
             control(info.repeatMode == 2 ? "repeat.1" : "repeat", 16, dim: !info.repeatOn, tint: info.repeatOn ? media.artworkColor : nil) { media.toggleRepeat() }
         } else if choice == "none" {
@@ -723,7 +711,7 @@ private struct ShelfPage: View {
             if shelf.items.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "tray.and.arrow.down.fill").font(.system(size: 22))
-                    Text("Drop files here").font(.system(size: 13, weight: .medium, design: .rounded))
+                    Text("Drop files, images, links or text").font(.system(size: 13, weight: .medium, design: .rounded))
                     Text("Drag them back out to any app").font(.system(size: 11, design: .rounded))
                         .foregroundStyle(.white.opacity(0.5))
                 }
@@ -731,30 +719,79 @@ private struct ShelfPage: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
-                        ForEach(shelf.items, id: \.self) { url in
-                            VStack(spacing: 3) {
-                                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 40, height: 40)
-                                Text(url.lastPathComponent).font(.system(size: 9, weight: .medium, design: .rounded))
-                                    .lineLimit(2).multilineTextAlignment(.center).frame(width: 64)
-                            }
-                            .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
-                            .onTapGesture(count: 2) { NSWorkspace.shared.open(url) }
-                            .contextMenu {
-                                Button("Open") { NSWorkspace.shared.open(url) }
-                                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-                                Button("AirDrop…") { NSSharingService(named: .sendViaAirDrop)?.perform(withItems: [url]) }
-                                Divider()
-                                Button("Remove from Shelf") { shelf.remove(url) }
-                                Button("Clear Shelf") { shelf.clear() }
-                            }
+                        // Newest first.
+                        ForEach(shelf.items.reversed(), id: \.self) { url in
+                            ShelfItemView(url: url)
                         }
                     }
                     .padding(8)
                 }
             }
         }
+        .overlay(alignment: .topTrailing) {
+            if !shelf.items.isEmpty {
+                Button { shelf.clear() } label: {
+                    Text("Clear all").font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Capsule().fill(Color.white.opacity(0.1)))
+                }
+                .buttonStyle(.plain)
+                .padding(6)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let notice = shelf.notice {
+                Text(notice).font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(Color.black.opacity(0.75)))
+                    .padding(.bottom, 4)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: shelf.notice)
         .background(border.strokeBorder(Color.white.opacity(model.dropTargeted ? 0.6 : 0.14),
                                         style: StrokeStyle(lineWidth: 1.3, dash: [5, 4])))
+    }
+}
+
+/// One shelf item: its Quick Look thumbnail (Finder icon until that arrives) and name; drag it out,
+/// double-click to open, hover for a remove button.
+private struct ShelfItemView: View {
+    let url: URL
+    @ObservedObject private var shelf = ShelfModel.shared
+    @StateObject private var hover = RowHover()
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(nsImage: shelf.thumbnails[url] ?? NSWorkspace.shared.icon(forFile: url.path))
+                .resizable().aspectRatio(contentMode: .fit).frame(width: 40, height: 40)
+            Text(url.lastPathComponent).font(.system(size: 9, weight: .medium, design: .rounded))
+                .lineLimit(2).multilineTextAlignment(.center).frame(width: 64)
+        }
+        .overlay(alignment: .topTrailing) {
+            if hover.on {
+                Button { shelf.remove(url) } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 13))
+                        .symbolRenderingMode(.palette).foregroundStyle(.white, Color.black.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .offset(x: 2, y: -4)
+                .help("Remove from Shelf")
+            }
+        }
+        .onHover { hover.on = $0 }
+        .onAppear { shelf.loadThumbnail(url) }
+        .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
+        .onTapGesture(count: 2) { NSWorkspace.shared.open(url) }
+        .contextMenu {
+            Button("Open") { NSWorkspace.shared.open(url) }
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            Button("AirDrop…") { NSSharingService(named: .sendViaAirDrop)?.perform(withItems: [url]) }
+            Divider()
+            Button("Remove from Shelf") { shelf.remove(url) }
+            Button("Clear Shelf") { shelf.clear() }
+        }
     }
 }
 
@@ -1293,7 +1330,7 @@ private final class UnlockState: ObservableObject {
 
 // MARK: - HUD bar
 
-/// Volume / brightness level: plain, gradient or segmented (Settings › Notch).
+/// Volume / brightness level: plain, gradient or segmented (Settings › Island).
 private struct HUDBar: View {
     let level: Float
     let style: String
@@ -1486,7 +1523,7 @@ extension View {
 }
 
 extension View {
-    /// Notification banners and rows: Liquid Glass or solid, per Settings › Integrations.
+    /// Notification banners and rows: Liquid Glass or solid, per Settings › Notifications & Apps.
     @ViewBuilder
     func notificationPlatter<S: Shape>(_ shape: S) -> some View {
         switch AppSettings.shared.config.notificationStyle {

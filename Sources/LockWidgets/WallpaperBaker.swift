@@ -8,6 +8,8 @@ import SwiftUI
 /// restored when the feature is turned off or the app quits.
 @MainActor
 final class WallpaperBaker {
+    /// The newest render per screen key (see bake()).
+    private static var latestBake: [String: URL] = [:]
     private let settings: AppSettings
     private let store: WidgetStore
     private var timer: Timer?
@@ -187,15 +189,20 @@ final class WallpaperBaker {
                 continue
             }
             // A new file name each time, otherwise macOS keeps showing its cached copy.
-            let url = directory.appendingPathComponent("\(key)-\(Int(Date().timeIntervalSince1970)).jpg")
+            // (Milliseconds, so two bakes in the same second never share a name.)
+            let url = directory.appendingPathComponent("\(key)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
             let directory = self.directory
+            // Bakes overlap (lock, config change, retry, screen change) and their writes finish in any
+            // order; only the newest may be applied, or an older one's cleanup deleted the picture the
+            // display had just been set to.
+            Self.latestBake[key] = url
             DispatchQueue.global(qos: .utility).async {
                 guard let data = NSBitmapImageRep(cgImage: image)
                     .representation(using: .jpeg, properties: [.compressionFactor: 0.92]),
                       (try? data.write(to: url, options: .atomic)) != nil else { return }
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
-                        guard AppSettings.shared.config.wallpaperMode,
+                        guard Self.latestBake[key] == url, AppSettings.shared.config.wallpaperMode,
                               let screen = NSScreen.screens.first(where: { Self.key(for: $0) == key }) else {
                             try? FileManager.default.removeItem(at: url)
                             return

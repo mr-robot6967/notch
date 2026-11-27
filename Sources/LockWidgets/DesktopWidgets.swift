@@ -16,7 +16,8 @@ final class DesktopWidgetsController {
         self.settings = settings
         self.store = store
         settings.$config
-            .map { "\($0.desktopWidgetsEnabled)|\($0.desktopLineMode)|\($0.widgets.filter(\.enabled).map(\.kind.rawValue))" }
+            // Sizes too: each panel holds a snapshot of its entry, so a Round/Wide change needs a rebuild.
+            .map { "\($0.desktopWidgetsEnabled)|\($0.desktopLineMode)|\($0.widgets.filter(\.enabled).map { entry in "\(entry.kind.rawValue):\(entry.size)" })" }
             .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in DispatchQueue.main.async { self?.rebuild() } }

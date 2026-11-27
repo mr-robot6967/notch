@@ -30,9 +30,14 @@ trap 'rm -rf "$WORK"' EXIT
 SLICES=()
 for arch in $ARCHS; do
     echo "Building release binary ($arch)..."
-    if swift build -c release --arch "$arch" 2>&1 | grep -v -e "ld: warning" -e "x86_64 architecture is deprecated"; then :; fi
     BIN_PATH=$(swift build -c release --arch "$arch" --show-bin-path)
-    if [ -x "$BIN_PATH/LockWidgets" ] && lipo "$BIN_PATH/LockWidgets" -verify_arch "$arch" 2>/dev/null; then
+    # A failed build used to leave the previous binary in place, which was then packaged as if new:
+    # remove it first and check the build's own exit status (not grep's).
+    rm -f "$BIN_PATH/LockWidgets"
+    BUILD_OK=1
+    swift build -c release --arch "$arch" >"$WORK/build-$arch.log" 2>&1 || BUILD_OK=0
+    grep -v -e "ld: warning" -e "x86_64 architecture is deprecated" "$WORK/build-$arch.log" || true
+    if [ "$BUILD_OK" = 1 ] && [ -x "$BIN_PATH/LockWidgets" ] && lipo "$BIN_PATH/LockWidgets" -verify_arch "$arch" 2>/dev/null; then
         cp "$BIN_PATH/LockWidgets" "$WORK/LockWidgets-$arch"
         SLICES+=("$WORK/LockWidgets-$arch")
     else

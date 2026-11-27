@@ -25,6 +25,11 @@ hdiutil create -volname "$VOL" -srcfolder "$STAGE" -ov -format UDRW -fs HFS+ "$R
 # Detach any stale mount with the same name.
 if [ -d "/Volumes/$VOL" ]; then hdiutil detach "/Volumes/$VOL" -force >/dev/null || true; fi
 MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | awk -F'\t' '/\/Volumes\//{print $NF}')
+[ -n "$MOUNT_DIR" ] || { echo "Could not mount $RW" >&2; exit 1; }
+# Never leave the image mounted if a later step fails.
+trap 'hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true' EXIT
+# If another "Notch" volume was still around, this one mounts as "Notch 1": lay out that one.
+VOL="$(basename "$MOUNT_DIR")"
 echo "Mounted at $MOUNT_DIR"
 
 echo "Laying out the Finder window..."
@@ -61,6 +66,7 @@ SetFile -a C "$MOUNT_DIR" 2>/dev/null || true
 
 sync
 hdiutil detach "$MOUNT_DIR" >/dev/null
+trap - EXIT
 echo "Compressing..."
 hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 rm -rf "$STAGE" "$RW"

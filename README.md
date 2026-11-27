@@ -2,7 +2,8 @@
 
 Notch turns the top of your Mac's screen into a live "island" and puts widgets on the real macOS lock screen. It runs from the menu bar and uses live data from your Mac.
 
-- **Island:** album art and a waveform while music plays; volume and brightness levels; charging, low battery, AirPods/Bluetooth connections, timer, Focus and calendar alerts; other apps' notifications (optional). Hover or click to open a player with seek, like/shuffle/repeat and output-device switching, plus pages for widgets, a file shelf (with AirDrop) and a timer.
+- **Island:** album art and a waveform while music plays; volume and brightness levels; charging, low battery, AirPods/Bluetooth connections, timer, Focus and calendar alerts; other apps' notifications (optional). Hover or click to open a player with seek, like/shuffle/repeat and output-device switching, plus pages for widgets, a file shelf (with AirDrop) and a timer. When nothing is playing (or a song has been paused for a minute) the closed island shows the weather, "Not playing" or nothing (Settings › Island › Behaviour › More options).
+- **File shelf:** drop anything on the notch (files, folders, images, links, text; several at once) and drag it back out later. It holds the 10 newest items and keeps them across launches.
 - **Lock screen:** weather, air quality, Mac and AirPods/Bluetooth batteries, next event and forecast, and a working music player. You can place everything in a live preview of your own lock screen.
 - **Optional desktop widgets**, Discord "Listening to…" status, and Spotify extras.
 
@@ -50,9 +51,10 @@ Opening Notch again (from Finder or Spotlight) shows its Settings.
 ## First-time setup
 
 1. Open Notch. It grows out of your notch and says hello.
-2. **Choose your features**: island, lock-screen widgets, notifications, volume and brightness, calendar, desktop widgets. Everything can be changed later.
-3. **Allow permissions**: only the ones your features need are listed, each with an Allow button that opens the right page in System Settings.
-4. Point at the notch to open the island, right-click it for Settings, and lock your Mac to see your widgets.
+2. **Choose your features**: island, lock-screen widgets, notifications, volume and brightness, calendar, desktop widgets, Spotify likes & devices. Everything can be changed later.
+3. **Allow permissions**: only the ones your features need are listed, each with an Allow button (it shows the system prompt, or opens the right page in System Settings).
+4. **Connect Spotify** (only if you picked it): paste your own Client ID (see Integrations below).
+5. Point at the notch to open the island, right-click it for Settings, and lock your Mac to see your widgets.
 
 You can replay this any time from **Settings › General › Show Welcome**.
 
@@ -66,7 +68,7 @@ Everything works without permissions; each one only turns on the features listed
 | Location | Local weather | Weather for your time-zone city, or a city you set in Settings |
 | Calendars | Next event, calendar page and event alerts | Calendar widgets show a hint instead |
 | Bluetooth | Alert when AirPods or other devices connect | No connection alert (battery levels still show) |
-| Automation (Music, Spotify) | Controls and artwork if the Now Playing helper can't run | Asked only when needed |
+| Automation (Music, Spotify, your browser) | Shuffle/repeat for Music and Spotify, controls and artwork if the Now Playing helper can't run; like/repeat for YouTube Music in a browser (also needs the browser's "Allow JavaScript from Apple Events"). Never launches an app that isn't running | Asked only when needed |
 | Full Disk Access | Showing other apps' notifications and Focus status in the island (Settings › Notifications & Apps, off by default). Read-only; nothing is stored | Notification mirroring stays off |
 
 Weather and air quality come from [Open-Meteo](https://open-meteo.com) (no account). With no internet connection the weather widgets show "No weather" and retry every couple of minutes.

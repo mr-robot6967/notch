@@ -18,7 +18,8 @@ final class YTMusicBridge: ObservableObject {
     /// Set when the browser refused to run the script (its setting is off), with where to turn it on.
     @Published private(set) var needsAppleEvents: String?
 
-    private static let chromium: [String: String] = [
+    // Constants, also read from the AppleScript queue: nonisolated so they aren't main-actor-bound.
+    private nonisolated static let chromium: [String: String] = [
         "com.google.Chrome": "Google Chrome", "com.brave.Browser": "Brave Browser",
         "com.microsoft.edgemac": "Microsoft Edge", "company.thebrowser.Browser": "Arc",
         "com.vivaldi.Vivaldi": "Vivaldi",
@@ -35,28 +36,36 @@ final class YTMusicBridge: ObservableObject {
 
     // YouTube Music's player bar. Like state is the like renderer's `like-status` attribute;
     // repeat state is in the repeat button's title ("Repeat off / all / one").
-    private static let stateJS = "(function(){var b=document.querySelector('ytmusic-player-bar');if(!b)return '';var r=b.querySelector('.repeat');var l=b.querySelector('ytmusic-like-button-renderer');var t=r?((r.getAttribute('title')||r.getAttribute('aria-label')||'')+'').toLowerCase():'';return JSON.stringify({repeat:t.indexOf('one')>=0?2:(t.indexOf('all')>=0?3:1),like:l?(l.getAttribute('like-status')||''):''});})()"
-    private static let likeJS = "(function(){var l=document.querySelector('ytmusic-player-bar ytmusic-like-button-renderer');if(!l)return '';var b=l.querySelector('#button-shape-like button')||l.querySelector('[aria-label=\"Like\"]')||l.querySelector('button');if(b){b.click();return 'ok';}return '';})()"
-    private static let shuffleJS = "(function(){var b=document.querySelector('ytmusic-player-bar .shuffle');if(b){b.click();return 'ok';}return '';})()"
-    private static let repeatJS = "(function(){var b=document.querySelector('ytmusic-player-bar .repeat');if(b){b.click();return 'ok';}return '';})()"
+    private nonisolated static let stateJS = "(function(){var b=document.querySelector('ytmusic-player-bar');if(!b)return '';var r=b.querySelector('.repeat');var l=b.querySelector('ytmusic-like-button-renderer');var t=r?((r.getAttribute('title')||r.getAttribute('aria-label')||'')+'').toLowerCase():'';return JSON.stringify({repeat:t.indexOf('one')>=0?2:(t.indexOf('all')>=0?3:1),like:l?(l.getAttribute('like-status')||''):''});})()"
+    private nonisolated static let likeJS = "(function(){var l=document.querySelector('ytmusic-player-bar ytmusic-like-button-renderer');if(!l)return '';var b=l.querySelector('#button-shape-like button')||l.querySelector('[aria-label=\"Like\"]')||l.querySelector('button');if(b){b.click();return 'ok';}return '';})()"
+    private nonisolated static let shuffleJS = "(function(){var b=document.querySelector('ytmusic-player-bar .shuffle');if(b){b.click();return 'ok';}return '';})()"
+    private nonisolated static let repeatJS = "(function(){var b=document.querySelector('ytmusic-player-bar .repeat');if(b){b.click();return 'ok';}return '';})()"
 
     /// Runs `js` in the first music.youtube.com tab. Returns (result, error message).
     private nonisolated static func run(_ js: String, in browser: (app: String, safari: Bool)) -> (String?, String?) {
         let escaped = js.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let action = browser.safari ? "do JavaScript \"\(escaped)\" in t" : "execute t javascript \"\(escaped)\""
+        // `is running` is checked inside the script as well: the browser may have quit since the
+        // caller looked, and a bare `tell application` would launch it again.
         let source = """
-        tell application "\(browser.app)"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t contains "music.youtube.com" then return \(action)
+        if application "\(browser.app)" is running then
+            tell application "\(browser.app)"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        if URL of t contains "music.youtube.com" then return \(action)
+                    end repeat
                 end repeat
-            end repeat
-        end tell
+            end tell
+        end if
         return "__none__"
         """
         var error: NSDictionary?
         let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if let error { return (nil, (error[NSAppleScript.errorMessage] as? String) ?? "error") }
+        if let error {
+            // -1743: Notch isn't allowed to control the browser (Automation) — not the JavaScript setting.
+            if (error[NSAppleScript.errorNumber] as? Int) == -1743 { return (nil, "automation-denied") }
+            return (nil, (error[NSAppleScript.errorMessage] as? String) ?? "error")
+        }
         let value = result?.stringValue
         return (value == "__none__" ? nil : value, nil)
     }
@@ -83,7 +92,9 @@ final class YTMusicBridge: ObservableObject {
 
     private func noteError(_ error: String?, browser: (app: String, safari: Bool)) {
         guard let error else { needsAppleEvents = nil; return }
-        if error.localizedCaseInsensitiveContains("javascript") || error.localizedCaseInsensitiveContains("apple event") {
+        if error == "automation-denied" {
+            needsAppleEvents = "Allow Notch to control \(browser.app) in System Settings › Privacy & Security › Automation."
+        } else if error.localizedCaseInsensitiveContains("javascript") || error.localizedCaseInsensitiveContains("apple event") {
             needsAppleEvents = browser.safari
                 ? "In Safari, turn on Develop › Allow JavaScript from Apple Events."
                 : "In \(browser.app), turn on View › Developer › Allow JavaScript from Apple Events."

@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.k2a.LockWidgets</string>
     <key>CFBundleVersion</key>
-    <string>1.3.0</string>
+    <string>1.4.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.0</string>
+    <string>1.4.0</string>
     <key>CFBundleExecutable</key>
     <string>Notch</string>
     <key>CFBundlePackageType</key>
@@ -33,7 +33,7 @@
     <key>NSCalendarsUsageDescription</key>
     <string>Notch shows your next event in the calendar widget.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Notch controls Music or Spotify playback from the notch and shows album art.</string>
+    <string>Notch controls Music, Spotify or YouTube Music in your browser from the notch and shows album art.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Notch shows a notch alert with the battery level when AirPods or other Bluetooth devices connect.</string>
     <key>NSLocationUsageDescription</key>

@@ -67,15 +67,20 @@ final class FocusWatcher: ObservableObject {
 
     private func refresh(announce: Bool) {
         let dir = self.dir
+        // The watcher is a process-wide singleton, so the reply goes to `FocusWatcher.shared` on the
+        // main actor rather than capturing `self` across the background hop.
         DispatchQueue.global(qos: .utility).async {
             let state = FocusWatcher.read(dir: dir)
-            DispatchQueue.main.async { [weak self] in
-                guard let self, let state else { return }
-                let changed = state.active != self.active
-                self.active = state.active
-                self.modeName = state.name
-                if changed && announce && Date() >= self.quietUntil && !NotchModel.shared.locked {
-                    NotchModel.shared.flash(.focus(state.active), seconds: 2.5)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let watcher = FocusWatcher.shared
+                    guard let state else { return }
+                    let changed = state.active != watcher.active
+                    watcher.active = state.active
+                    watcher.modeName = state.name
+                    if changed && announce && Date() >= watcher.quietUntil && !NotchModel.shared.locked {
+                        NotchModel.shared.flash(.focus(state.active), seconds: 2.5)
+                    }
                 }
             }
         }
@@ -83,8 +88,17 @@ final class FocusWatcher: ObservableObject {
 
     /// nil when the store can't be read (no Full Disk Access) — then nothing is ever held back.
     nonisolated static func read(dir: URL) -> (active: Bool, name: String)? {
-        guard let data = try? Data(contentsOf: dir.appendingPathComponent("Assertions.json")),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let data: Data
+        do {
+            data = try Data(contentsOf: dir.appendingPathComponent("Assertions.json"))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            // Readable store but no assertions file: no Focus on. (Returning nil here would leave a
+            // Focus that just ended "on" forever, holding back every notification.)
+            return FileManager.default.isReadableFile(atPath: dir.path) ? (false, "") : nil
+        } catch {
+            return nil
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let entries = json["data"] as? [[String: Any]] else { return nil }
         let records = entries.flatMap { ($0["storeAssertionRecords"] as? [[String: Any]]) ?? [] }
         guard let first = records.first else { return (false, "") }

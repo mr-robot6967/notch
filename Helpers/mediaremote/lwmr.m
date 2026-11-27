@@ -33,6 +33,8 @@ static NSString *str(id value) { return [value isKindOfClass:[NSString class]] ?
 static NSNumber *num(id value) { return [value isKindOfClass:[NSNumber class]] ? value : nil; }
 
 static void write_line(NSDictionary *object) {
+    // dataWithJSONObject throws (it doesn't return nil) on NaN/Inf, which killed the helper.
+    if (![NSJSONSerialization isValidJSONObject:object]) return;
     NSData *json = [NSJSONSerialization dataWithJSONObject:object options:0 error:nil];
     if (!json) return;
     fwrite(json.bytes, 1, json.length, stdout);
@@ -62,11 +64,11 @@ static void emit(void) {
                 NSNumber *duration = num(info[@"kMRMediaRemoteNowPlayingInfoDuration"]);
                 if (duration && isfinite(duration.doubleValue)) out[@"duration"] = duration;
                 NSNumber *elapsed = num(info[@"kMRMediaRemoteNowPlayingInfoElapsedTime"]);
-                if (elapsed) out[@"elapsed"] = elapsed;
+                if (elapsed && isfinite(elapsed.doubleValue)) out[@"elapsed"] = elapsed;
                 NSNumber *rate = num(info[@"kMRMediaRemoteNowPlayingInfoPlaybackRate"]);
-                if (rate) out[@"rate"] = rate;
+                if (rate && isfinite(rate.doubleValue)) out[@"rate"] = rate;
                 id timestamp = info[@"kMRMediaRemoteNowPlayingInfoTimestamp"];
-                if ([timestamp isKindOfClass:[NSDate class]]) out[@"timestamp"] = @([(NSDate *)timestamp timeIntervalSince1970]);
+                if ([timestamp isKindOfClass:[NSDate class]] && isfinite([(NSDate *)timestamp timeIntervalSince1970])) out[@"timestamp"] = @([(NSDate *)timestamp timeIntervalSince1970]);
                 NSNumber *shuffle = num(info[@"kMRMediaRemoteNowPlayingInfoShuffleMode"]);
                 if (shuffle) out[@"shuffle"] = shuffle;
                 NSNumber *repeat = num(info[@"kMRMediaRemoteNowPlayingInfoRepeatMode"]);

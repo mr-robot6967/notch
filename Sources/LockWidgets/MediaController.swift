@@ -27,7 +27,7 @@ struct NowPlayingInfo: Equatable {
     var shuffleOn: Bool { shuffleMode > 1 }
     var repeatOn: Bool { repeatMode > 1 }
 
-    /// Title without extras like "(From …)", "(feat. …)", "- Remastered 2011" (Settings › Notch).
+    /// Title without extras like "(From …)", "(feat. …)", "- Remastered 2011" (Settings › Island).
     @MainActor var displayTitle: String {
         guard AppSettings.shared.config.cleanSongTitles else { return title }
         return NowPlayingInfo.clean(title)
@@ -60,8 +60,9 @@ struct NowPlayingInfo: Equatable {
 
     /// Playback position now, extrapolated while playing (no polling needed).
     func currentPosition(at date: Date = Date()) -> Double {
-        guard isPlaying else { return elapsed }
-        let p = elapsed + date.timeIntervalSince(elapsedDate) * (rate > 0 ? rate : 1)
+        // Clamped while paused too: a player can report elapsed past the end (or < 0), which made the
+        // progress bar wider than its track or gave it a negative width.
+        let p = !isPlaying ? elapsed : elapsed + date.timeIntervalSince(elapsedDate) * (rate > 0 ? rate : 1)
         return duration > 0 ? min(duration, max(0, p)) : max(0, p)
     }
 
@@ -83,7 +84,56 @@ struct NowPlayingInfo: Equatable {
 final class MediaController: ObservableObject {
     static let shared = MediaController()
 
-    @Published private(set) var info: NowPlayingInfo?
+    @Published private(set) var info: NowPlayingInfo? { didSet { updatePauseClock() } }
+    /// When playback stopped (nil while playing or with no song). The collapsed island keeps a
+    /// paused song for `pausedGrace` seconds, then shows its idle content; the open island keeps
+    /// the player so the song can still be resumed.
+    @Published private(set) var pausedSince: Date?
+    static let pausedGrace: TimeInterval = 3
+    private var pauseExpiry: DispatchWorkItem?
+
+    /// The collapsed island should still show the current song (playing, or paused < 60 s).
+    var songIsRecent: Bool {
+        guard let info else { return false }
+        if info.isPlaying { return true }
+        guard let pausedSince else { return false }
+        return Date().timeIntervalSince(pausedSince) < Self.pausedGrace
+    }
+
+    private func updatePauseClock() {
+        guard let info, !info.isPlaying else {
+            // Playing again (or nothing at all): the pause is over.
+            pauseExpiry?.cancel()
+            pauseExpiry = nil
+            if pausedSince != nil { pausedSince = nil }
+            return
+        }
+        guard pausedSince == nil else { return } // already counting this pause
+        pausedSince = Date()
+        // One timer per pause (no polling): when the grace ends, republish so the island re-reads
+        // `songIsRecent` and morphs to its idle content.
+        let work = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let media = MediaController.shared
+                media.pauseExpiry = nil
+                withAnimation(IslandMotion.activity) { media.objectWillChange.send() }
+            }
+        }
+        pauseExpiry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pausedGrace + 0.05, execute: work)
+    }
+
+    /// AppleScript for Spotify/Music that does nothing unless the app is already running: a bare
+    /// `tell application` launches it (e.g. pressing play after quitting it, or a race with quitting).
+    nonisolated static func ifRunning(_ app: String, _ body: String) -> String {
+        """
+        if application "\(app)" is running then
+            tell application "\(app)"
+                \(body)
+            end tell
+        end if
+        """
+    }
     @Published private(set) var artwork: NSImage?
     /// Dominant colour of the artwork, used as an accent in the player.
     @Published private(set) var artworkColor: Color = .white
@@ -120,7 +170,11 @@ final class MediaController: ObservableObject {
     private func refreshAfterWake() {
         if usingHelper {
             send("refresh")
-        } else if helper == nil, helperRetry == nil {
+        } else if helper == nil {
+            // After repeated failures a slow retry (up to 10 min) is pending; wake/unlock is exactly
+            // when mediaremoted is back, so retry now instead of waiting for it.
+            helperRetry?.cancel()
+            helperRetry = nil
             helperFailures = 0
             _ = startHelper()
         }
@@ -171,8 +225,8 @@ final class MediaController: ObservableObject {
             return
         }
         let source = player.app == "Spotify"
-            ? "tell application \"Spotify\" to return {shuffling, repeating}"
-            : "tell application \"Music\" to return {shuffle enabled, (song repeat as string)}"
+            ? Self.ifRunning("Spotify", "return {shuffling, repeating}")
+            : Self.ifRunning("Music", "return {shuffle enabled, (song repeat as string)}")
         appleScriptQueue.async {
             var error: NSDictionary?
             guard let result = NSAppleScript(source: source)?.executeAndReturnError(&error), error == nil,
@@ -235,8 +289,8 @@ final class MediaController: ObservableObject {
         if let player = scriptablePlayer() {
             if var current = info { current.shuffleMode = current.shuffleOn ? 1 : 2; info = current }
             runPlayerScript(player.app == "Spotify"
-                ? "tell application \"Spotify\" to set shuffling to not shuffling"
-                : "tell application \"Music\" to set shuffle enabled to not shuffle enabled")
+                ? Self.ifRunning("Spotify", "set shuffling to not shuffling")
+                : Self.ifRunning("Music", "set shuffle enabled to not shuffle enabled"))
             return
         }
         guard usingHelper else { return }
@@ -261,12 +315,11 @@ final class MediaController: ObservableObject {
         if let player = scriptablePlayer() {
             if player.app == "Spotify" {
                 if var current = info { current.repeatMode = current.repeatOn ? 1 : 3; info = current }
-                runPlayerScript("tell application \"Spotify\" to set repeating to not repeating")
+                runPlayerScript(Self.ifRunning("Spotify", "set repeating to not repeating"))
             } else {
                 // Music cycles Off → All → One → Off, like its own button.
                 if var current = info { current.repeatMode = current.repeatMode == 3 ? 2 : (current.repeatMode == 2 ? 1 : 3); info = current }
-                runPlayerScript("""
-                tell application "Music"
+                runPlayerScript(Self.ifRunning("Music", """
                     if song repeat is off then
                         set song repeat to all
                     else if song repeat is all then
@@ -274,8 +327,7 @@ final class MediaController: ObservableObject {
                     else
                         set song repeat to off
                     end if
-                end tell
-                """)
+                    """))
             }
             return
         }
@@ -315,7 +367,7 @@ final class MediaController: ObservableObject {
                 info = current
             }
         } else if let app = fallbackApp {
-            let source = "tell application \"\(app)\" to \(script)"
+            let source = Self.ifRunning(app, script)
             scriptQueue.async { _ = Self.runScript(source) }
         }
     }
@@ -563,7 +615,8 @@ final class MediaController: ObservableObject {
         guard let u = userInfo else { return }
         let state = (u["Player State"] as? String ?? "").lowercased()
         if state == "stopped" {
-            if fallbackApp == app { info = nil; setArtwork(nil) }
+            // Forget the app too, so later controls never address an app that has quit.
+            if fallbackApp == app { info = nil; setArtwork(nil); fallbackApp = nil }
             return
         }
         fallbackApp = app
@@ -579,10 +632,10 @@ final class MediaController: ObservableObject {
     private func fetchFallbackArtwork(app: String) {
         scriptQueue.async {
             var image: NSImage?
-            if app == "Music", let data = Self.runScript("tell application \"Music\" to get data of artwork 1 of current track")?.data {
+            if app == "Music", let data = Self.runScript(Self.ifRunning("Music", "return data of artwork 1 of current track"))?.data {
                 image = NSImage(data: data)
             } else if app == "Spotify",
-                      let s = Self.runScript("tell application \"Spotify\" to get artwork url of current track")?.stringValue,
+                      let s = Self.runScript(Self.ifRunning("Spotify", "return artwork url of current track"))?.stringValue,
                       let url = URL(string: s), url.scheme == "https", let data = try? Data(contentsOf: url) {
                 image = NSImage(data: data)
             }

@@ -102,8 +102,11 @@ final class Extras {
         let minutes = Int((event.start.timeIntervalSinceNow / 60).rounded(.up))
         guard minutes >= 0, minutes <= cfg.calendarPeekMinutes else { return }
         let key = "\(event.title)|\(event.start.timeIntervalSince1970)"
-        guard peeked.insert(key).inserted else { return }
-        NotchModel.shared.flash(.event(title: event.title, minutes: minutes, colorHex: event.colorHex), seconds: 6)
+        guard !peeked.contains(key) else { return }
+        // Held back (locked, Focus, turned off): no chime with nothing on screen, and the event stays
+        // un-peeked so it can still show once allowed (e.g. right after unlocking).
+        guard NotchModel.shared.flash(.event(title: event.title, minutes: minutes, colorHex: event.colorHex), seconds: 6) else { return }
+        peeked.insert(key)
         if cfg.lockSounds { SystemSounds.play("Glass") }
     }
 }

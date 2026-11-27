@@ -3,7 +3,9 @@ import ApplicationServices
 import Combine
 import CoreAudio
 import IOBluetooth
+import QuickLookThumbnailing
 import SwiftUI
+import UniformTypeIdentifiers
 import LockWidgetsCore
 
 // MARK: - State
@@ -23,7 +25,7 @@ enum LiveActivity: Equatable {
     case focus(Bool)
     case songChange(title: String, artist: String)
 
-    /// Key used by Settings › Notch to turn each kind on or off.
+    /// Key used by Settings › Activities to turn each kind on or off.
     var settingKey: String {
         switch self {
         case .charging: return "charging"
@@ -126,17 +128,61 @@ final class NotchModel: ObservableObject {
         return pages.isEmpty ? [.nowPlaying] : pages
     }
 
+    // Why the page is what it is. `page` used to persist forever, so a page switched to for one
+    // task (the shelf while dragging a file, Notifications for a reply) was still what the island
+    // opened on much later, e.g. the shelf instead of the song that's now playing.
+    /// When the user last picked a page themselves (swipe, page dot).
+    private(set) var pageChosenByUserAt: Date?
+    /// The current page was switched to automatically for a task, not chosen by the user.
+    private(set) var autoPage = false
+    /// A manual choice is kept for openings within this long; after that context decides again.
+    static let manualPageMemory: TimeInterval = 120
+
+    /// The user picked a page.
+    func choosePage(_ newPage: NotchPage) {
+        page = newPage
+        pageChosenByUserAt = Date()
+        autoPage = false
+    }
+
+    /// A page switched to automatically for a task (drop on the shelf, reply, a page turned off).
+    func showPageAutomatically(_ newPage: NotchPage) {
+        page = newPage
+        autoPage = true
+    }
+
+    /// The page an opening should show: a recent manual choice is kept; otherwise what's going on
+    /// decides (music playing → Now Playing, a running timer → Timer, else the first page).
+    func pickPageForOpening() {
+        let pages = availablePages
+        if let forcedPage, pages.contains(forcedPage) { page = forcedPage; return }
+        let recentChoice = !autoPage && pageChosenByUserAt.map { Date().timeIntervalSince($0) < Self.manualPageMemory } == true
+        if recentChoice, pages.contains(page) { return }
+        let contextual: NotchPage
+        if MediaController.shared.info?.isPlaying == true, pages.contains(.nowPlaying) {
+            contextual = .nowPlaying
+        } else if NotchTimer.shared.isRunning, pages.contains(.timer) {
+            contextual = .timer
+        } else {
+            contextual = pages[0]
+        }
+        page = contextual
+        autoPage = true // chosen by context, so the next opening re-evaluates too
+    }
+
     func cyclePage(forward: Bool) {
         let pages = availablePages
-        guard let index = pages.firstIndex(of: page) else { page = pages[0]; return }
+        guard let index = pages.firstIndex(of: page) else { choosePage(pages[0]); return }
         let next = (index + (forward ? 1 : -1) + pages.count) % pages.count
-        withAnimation(IslandMotion.page) { page = pages[next] }
+        withAnimation(IslandMotion.page) { choosePage(pages[next]) }
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
     }
 
     /// Shows a live activity for a few seconds (if that kind is enabled in Settings).
     func dismissTransient() {
         clearWork?.cancel()
+        // A song peek queued behind the dismissed status is stale now; never replay it later.
+        pendingPeek = nil
         withAnimation(IslandMotion.activity) { transient = nil }
     }
 
@@ -149,26 +195,28 @@ final class NotchModel: ObservableObject {
         }
     }
 
-    func flash(_ activity: LiveActivity, seconds: Double = 3) {
+    /// Returns false when the activity was held back (turned off, Focus, locked).
+    @discardableResult
+    func flash(_ activity: LiveActivity, seconds: Double = 3) -> Bool {
         let cfg = AppSettings.shared.config
-        guard cfg.notchEnabled, !cfg.disabledActivities.contains(activity.settingKey) else { return }
+        guard cfg.notchEnabled, !cfg.disabledActivities.contains(activity.settingKey) else { return false }
         // Respect Do Not Disturb / Focus (Settings › Focus).
         switch activity {
-        case .notification: if FocusWatcher.shared.holds(.notification) { return }
-        case .event, .songChange: if FocusWatcher.shared.holds(.peek) { return }
+        case .notification: if FocusWatcher.shared.holds(.notification) { return false }
+        case .event, .songChange: if FocusWatcher.shared.holds(.peek) { return false }
         default: break
         }
         // Never show message or event text on the lock screen.
         if locked {
             switch activity {
-            case .notification, .event, .songChange: return
+            case .notification, .event, .songChange: return false
             default: break
             }
         }
         // A song peek never cuts off a status that is still on screen; it plays right after.
         if case .songChange = activity, Self.isStatus(transient) {
             pendingPeek = (activity, Date())
-            return
+            return true
         }
         withAnimation(IslandMotion.activity) { transient = activity }
         transientSince = Date()
@@ -192,6 +240,7 @@ final class NotchModel: ObservableObject {
         }
         clearWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+        return true
     }
 }
 
@@ -235,34 +284,193 @@ final class NotchTimer: ObservableObject {
     }
 }
 
-/// Files dropped on the notch, kept between launches.
+/// Things dropped on the notch, kept between launches. Files and folders are kept by path; dragged
+/// content that isn't a file (an image from a browser, text, a link) is saved as a file in the
+/// app's cache folder first, so every item can be dragged back out.
 @MainActor
 final class ShelfModel: ObservableObject {
     static let shared = ShelfModel()
+    static let capacity = 10
+    /// Anything can be dropped; `load` decides how to keep it.
+    static let acceptedTypes: [UTType] = [.fileURL, .image, .url, .text, .item]
+
+    /// Oldest first, newest last.
     @Published private(set) var items: [URL] = []
+    /// A short message shown on the shelf (e.g. when the oldest items made room for new ones).
+    @Published private(set) var notice: String?
+    /// Quick Look thumbnails by item (the Finder icon is shown until one arrives).
+    @Published private(set) var thumbnails: [URL: NSImage] = [:]
+    private var noticeWork: DispatchWorkItem?
+
+    nonisolated static var cacheDir: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent(Bundle.main.bundleIdentifier ?? "Notch", isDirectory: true)
+            .appendingPathComponent("Shelf", isDirectory: true)
+    }
 
     private init() {
-        items = AppSettings.shared.config.shelfItems
-            .map { URL(fileURLWithPath: $0) }
+        // Saved items whose files are gone (moved, deleted, cache cleared) are dropped.
+        let saved = AppSettings.shared.config.shelfItems
+        let existing = saved.map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
+        items = Array(existing.suffix(Self.capacity))
+        if items.map(\.path) != saved { save() }
     }
 
     func add(_ urls: [URL]) {
-        for url in urls where !items.contains(url) { items.append(url) }
+        guard !urls.isEmpty else { return }
+        var list = items
+        for url in urls {
+            let url = url.standardizedFileURL
+            // The same file again moves it to the newest spot instead of showing it twice.
+            list.removeAll { $0.standardizedFileURL == url }
+            list.append(url)
+        }
+        if list.count > Self.capacity {
+            let dropped = list.prefix(list.count - Self.capacity)
+            list.removeFirst(list.count - Self.capacity)
+            dropped.forEach(deleteIfCached)
+            showNotice("Shelf holds \(Self.capacity) items")
+        }
+        items = list
         save()
+        list.forEach(loadThumbnail)
     }
 
     func remove(_ url: URL) {
         items.removeAll { $0 == url }
+        deleteIfCached(url)
         save()
     }
 
     func clear() {
+        items.forEach(deleteIfCached)
         items.removeAll()
         save()
     }
 
     private func save() { AppSettings.shared.config.shelfItems = items.map(\.path) }
+
+    private func showNotice(_ text: String) {
+        notice = text
+        noticeWork?.cancel()
+        let work = DispatchWorkItem { MainActor.assumeIsolated { ShelfModel.shared.notice = nil } }
+        noticeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+    }
+
+    /// Files we created for non-file drops are ours to delete; the user's own files never are.
+    private func deleteIfCached(_ url: URL) {
+        thumbnails[url] = nil
+        guard url.standardizedFileURL.path.hasPrefix(Self.cacheDir.standardizedFileURL.path + "/") else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    func loadThumbnail(_ url: URL) {
+        guard thumbnails[url] == nil else { return }
+        let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 44, height: 44), scale: 2,
+                                                   representationTypes: .thumbnail)
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, _ in
+            guard let cg = rep?.cgImage else { return }
+            let size = NSSize(width: cg.width, height: cg.height)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let shelf = ShelfModel.shared
+                    guard shelf.items.contains(url) else { return }
+                    shelf.thumbnails[url] = NSImage(cgImage: cg, size: size)
+                }
+            }
+        }
+    }
+
+    /// Collects one result per dragged item, then adds them in drag order. Main-actor isolated, so
+    /// the loaders' callbacks can hold it and hop back to main to fill it in.
+    @MainActor private final class DropBatch {
+        var results: [URL?]
+        var remaining: Int
+        init(count: Int) { results = Array(repeating: nil, count: count); remaining = count }
+    }
+
+    /// Loads every item of a drop (not just the first), then adds them and opens the shelf.
+    func accept(_ providers: [NSItemProvider]) {
+        guard !providers.isEmpty else { return }
+        let dir = Self.cacheDir
+        let box = DropBatch(count: providers.count)
+        for (index, provider) in providers.enumerated() {
+            Self.load(provider, into: dir) { url in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        box.results[index] = url
+                        box.remaining -= 1
+                        guard box.remaining == 0 else { return }
+                        ShelfModel.shared.finishDrop(box.results.compactMap { $0 })
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishDrop(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        add(urls)
+        guard !NotchModel.shared.locked, AppSettings.shared.config.notchExpandMode != .never else { return }
+        AppDelegate.shared?.notch?.expand(on: .shelf)
+        NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+    }
+
+    /// Turns one dragged item into a file URL: files/folders as they are; images, links, text and
+    /// other data written to the cache folder.
+    nonisolated private static func load(_ provider: NSItemProvider, into dir: URL, done: @escaping @Sendable (URL?) -> Void) {
+        let name = provider.suggestedName
+        func has(_ type: UTType) -> Bool { provider.hasItemConformingToTypeIdentifier(type.identifier) }
+        if has(.fileURL) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in done(url?.isFileURL == true ? url : nil) }
+        } else if has(.image) {
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                guard let data, let image = NSImage(data: data), let tiff = image.tiffRepresentation,
+                      let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { done(nil); return }
+                done(write(png, name: name ?? "Image", ext: "png", in: dir))
+            }
+        } else if has(.url) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { done(nil); return }
+                let plist = try? PropertyListSerialization.data(fromPropertyList: ["URL": url.absoluteString], format: .xml, options: 0)
+                done(plist.flatMap { write($0, name: name ?? url.host ?? "Link", ext: "webloc", in: dir) })
+            }
+        } else if has(.text) {
+            _ = provider.loadObject(ofClass: NSString.self) { text, _ in
+                guard let text = text as? NSString, text.length > 0 else { done(nil); return }
+                done(write(Data((text as String).utf8), name: name ?? "Text", ext: "txt", in: dir))
+            }
+        } else if let type = provider.registeredTypeIdentifiers.compactMap(UTType.init).first(where: { $0.conforms(to: .data) }) {
+            // Other data (e.g. a file promise's contents): copy the temporary file it's handed in.
+            _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { tmp, _ in
+                guard let tmp, let data = try? Data(contentsOf: tmp) else { done(nil); return }
+                let base = name ?? tmp.deletingPathExtension().lastPathComponent
+                done(write(data, name: base, ext: tmp.pathExtension.isEmpty ? (type.preferredFilenameExtension ?? "data") : tmp.pathExtension, in: dir))
+            }
+        } else {
+            done(nil)
+        }
+    }
+
+    /// Writes `data` as "<name>.<ext>" in `dir`, never overwriting an earlier drop.
+    nonisolated private static func write(_ data: Data, name: String, ext: String, in dir: URL) -> URL? {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var base = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { base = "Item" }
+        if base.lowercased().hasSuffix("." + ext) { base = String(base.dropLast(ext.count + 1)) }
+        base = String(base.prefix(80))
+        var url = dir.appendingPathComponent(base).appendingPathExtension(ext)
+        var n = 2
+        while fm.fileExists(atPath: url.path) {
+            url = dir.appendingPathComponent("\(base) \(n)").appendingPathExtension(ext)
+            n += 1
+        }
+        return (try? data.write(to: url, options: .atomic)) != nil ? url : nil
+    }
 }
 
 // MARK: - System monitors
@@ -557,7 +765,7 @@ final class NotchController {
                 guard let self else { return }
                 if self.settings.config.notchExpandMode == .never, self.model.expanded { self.collapse() }
                 let pages = self.model.availablePages
-                if !pages.contains(self.model.page) { self.model.page = pages[0] }
+                if !pages.contains(self.model.page) { self.model.showPageAutomatically(pages[0]) }
             }
             .store(in: &cancellables)
 
@@ -861,6 +1069,7 @@ final class NotchController {
         case .timer: return CGSize(width: g.width + 2 * 70 * k, height: g.height)
         case .locked: return CGSize(width: g.width + 2 * (g.height * 0.8), height: g.height)
         case .idleWeather: return CGSize(width: g.width + 2 * (g.height * 0.95), height: g.height)
+        case .idleNotPlaying: return CGSize(width: g.width + 2 * 84 * k, height: g.height) // fits "Not playing"
         default: return CGSize(width: g.width + 2 * 50 * k, height: g.height)
         }
     }
@@ -883,12 +1092,11 @@ final class NotchController {
     func openReply(to note: MirroredNotification) -> Bool {
         guard note.canReply, settings.config.notchExpandMode != .never, !model.locked, !hiddenForFullscreen else { return false }
         model.forcedPage = .notifications
-        model.page = .notifications
         let reply = ReplyState.shared
         reply.activeID = note.id
         reply.text = ""
         reply.status = nil
-        expand()
+        expand(on: .notifications)
         guard model.expanded else { model.forcedPage = nil; return false }
         // The text field needs a key window to type into.
         panel.makeKey()
@@ -898,12 +1106,19 @@ final class NotchController {
     /// Let the reply field take typing (the island is a non-activating panel).
     func focusPanel() { panel.makeKey() }
 
-    func expand() {
+    /// Opens the island. `page` is a page this opening is for (a drop → the shelf, a reply →
+    /// Notifications); without one, an opening picks its page from context (see pickPageForOpening).
+    func expand(on page: NotchPage? = nil) {
         // Hidden over a fullscreen app the panel is transparent and ignores the mouse, so an island
         // opened from the context menu or Settings there would stay open, invisibly, until later.
         guard settings.config.notchEnabled, settings.config.notchExpandMode != .never, !model.locked,
               !hiddenForFullscreen else { return }
-        if !model.availablePages.contains(model.page) { model.page = model.availablePages[0] }
+        if let page, model.availablePages.contains(page) {
+            model.showPageAutomatically(page)
+        } else if !model.expanded {
+            model.pickPageForOpening()
+        }
+        if !model.availablePages.contains(model.page) { model.showPageAutomatically(model.availablePages[0]) }
         withAnimation(IslandMotion.open) { model.expanded = true }
         if YTMusicBridge.browser(for: MediaController.shared.info?.bundleIdentifier) != nil { YTMusicBridge.shared.refresh() }
         if settings.config.notchHaptics { NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now) }
@@ -1053,8 +1268,8 @@ final class NotchController {
                     guard let self else { return }
                     self.hoverWork = nil
                     guard dragging || self.hoverZone().contains(NSEvent.mouseLocation) else { return }
-                    if dragging { self.model.page = .shelf }
-                    self.expand()
+                    // Dragging something over the notch opens on the shelf for this opening only.
+                    self.expand(on: dragging && self.model.availablePages.contains(.shelf) ? .shelf : nil)
                 }
                 hoverWork = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + (dragging ? 0.05 : max(0.01, settings.config.hoverDelay)), execute: work)
@@ -1119,6 +1334,8 @@ enum NotchContent: Equatable {
     case timer
     case nowPlaying
     case idleWeather
+    /// Idle: a dimmed note and "Not playing".
+    case idleNotPlaying
 
     @MainActor
     static func current(model: NotchModel) -> NotchContent {
@@ -1133,11 +1350,17 @@ enum NotchContent: Equatable {
         }
         if model.locked, cfg.lockedIndicator != "none" { return .locked }
         if NotchTimer.shared.isRunning { return .timer }
-        if let info = MediaController.shared.info, info.isPlaying, !cfg.disabledActivities.contains("nowPlaying"),
+        // Playing, or paused less than a minute ago (MediaController.pausedGrace); after that the
+        // paused song gives way to the idle content until playback resumes.
+        let media = MediaController.shared
+        if let info = media.info, media.songIsRecent, !cfg.disabledActivities.contains("nowPlaying"),
            !(cfg.notchHideWhenSourceActive && info.bundleIdentifier == NSWorkspace.shared.frontmostApplication?.bundleIdentifier) {
             return .nowPlaying
         }
-        if cfg.idleActivity == "weather", WidgetStore.shared.weather != nil { return .idleWeather }
-        return .idle
+        switch cfg.idleActivity {
+        case "weather" where WidgetStore.shared.weather != nil: return .idleWeather
+        case "notPlaying": return .idleNotPlaying
+        default: return .idle
+        }
     }
 }

@@ -82,7 +82,10 @@ private final class OnboardingState: ObservableObject {
         accessibility = AXIsProcessTrusted()
         // Called every second while the welcome is open; re-reading the notification database (and
         // clearing the island's list) each time is only needed until access shows up.
-        if !NotificationMirror.shared.hasAccess { NotificationMirror.shared.recheckAccess() }
+        // (Only when notifications are switched on; otherwise nothing needs that access.)
+        if AppSettings.shared.config.mirrorNotifications, !NotificationMirror.shared.hasAccess {
+            NotificationMirror.shared.recheckAccess()
+        }
         fullDisk = NotificationMirror.shared.hasAccess
         location = locationManager.authorizationStatus
         calendar = EKEventStore.authorizationStatus(for: .event)
@@ -219,6 +222,9 @@ private struct OnboardingView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
+                // Invisible buttons still take Return: pressing it mid-greeting skipped ahead and left
+                // step 0 blank (no title, hidden button) when coming Back to it.
+                .disabled(!state.showWelcome)
                 .opacity(state.showWelcome ? 1 : 0)
                 .padding(.bottom, 28)
         }
@@ -338,7 +344,12 @@ private struct OnboardingView: View {
     private var spotifyStep: some View {
         StepLayout(symbol: "heart.fill", title: "Connect Spotify",
                    subtitle: "Uses your own free Spotify app, so it never runs into anyone else's limits.",
-                   back: { state.step = 2 }, next: { state.step = 4 }) {
+                   back: { state.step = 2 }, next: {
+                       // Keep a typed Client ID even if Connect wasn't pressed.
+                       let id = state.spotifyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                       if !id.isEmpty { settings.config.spotifyClientID = id }
+                       state.step = 4
+                   }) {
             SpotifySetupCard(draft: $state.spotifyDraft)
         }
     }

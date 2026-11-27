@@ -122,7 +122,6 @@ struct Config: Codable, Equatable {
 
     // Notch island
     var notchEnabled: Bool = true
-    var notchExpandOnHover: Bool = true
     var notchExpandMode: NotchExpandMode = .hover
     var hoverDelay: Double = 0
     var hoverMigrated: Bool = true
@@ -146,13 +145,18 @@ struct Config: Codable, Equatable {
     var lockedIndicator: String = "icon"
     var lockIndicatorMigrated: Bool = true
     var cleanSongTitles: Bool = true
-    var idleActivity: String = "none"   // none | weather
+    /// What the collapsed island shows when nothing is playing (or a song has been paused for a
+    /// minute): "weather", "notPlaying" (a dimmed note + "Not playing") or "none" (plain notch).
+    /// When nothing plays the island returns to its normal state (plain notch) unless the user picks
+    /// "Not playing" or weather in Settings.
+    var idleActivity: String = "none"
+    var idleMigrated: Bool = true
+    var idleRestored: Bool = true
     var hudStyle: String = "level"      // level | gradient | glow | plain | segments
     var hudStyleMigrated: Bool = true
     var showMenuBarIcon: Bool = true
     var songChangePeek: Bool = true
     var notificationReply: Bool = true
-    var notchTilt: Bool = true
     var notchLeftControl: String = "like"   // like | shuffle | repeat | none
     var notchHideInFullscreen: Bool = true
     var notchHideFromCapture: Bool = false
@@ -307,6 +311,13 @@ struct Config: Codable, Equatable {
             config.lockedIndicator = "icon"
             config.lockIndicatorMigrated = true
         }
+        // Weather was briefly made the idle default and switched on for everyone; the island should
+        // return to its normal (plain) state when nothing plays. Undo that once.
+        if saved["idleRestored"] == nil {
+            if config.idleActivity == "weather" { config.idleActivity = "none" }
+            config.idleRestored = true
+            config.idleMigrated = true
+        }
         // The app was renamed: carry the saved built-in sound choice over.
         if config.lockSoundName == "Islet Lock" { config.lockSoundName = "Notch Lock" }
         if config.unlockSoundName == "Islet Unlock" { config.unlockSoundName = "Notch Unlock" }
@@ -424,6 +435,8 @@ final class AppSettings: ObservableObject {
         var fresh = Config()
         fresh.hasLaunchedBefore = true
         fresh.launchAtLoginConfigured = config.launchAtLoginConfigured
+        // Not a preference either: resetting re-ran the welcome on the next launch.
+        fresh.onboardingDone = config.onboardingDone
         fresh.originalWallpapers = config.originalWallpapers
         fresh.wallpaperMode = config.wallpaperMode
         // Not preferences: a reset must not re-register the login item the user turned off, empty

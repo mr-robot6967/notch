@@ -7,15 +7,24 @@ private let discordLog = Logger(subsystem: "com.k2a.LockWidgets", category: "dis
 /// Minimal Discord RPC client over the local IPC socket ($TMPDIR/discord-ipc-N).
 /// Frame = little-endian UInt32 opcode + UInt32 length + JSON. Only SET_ACTIVITY is used, which needs
 /// no OAuth — just the Client ID of a (free) application from the Discord Developer Portal.
-final class DiscordIPC {
+///
+/// Thread confinement: all state is touched only on `queue` (blocking socket I/O must stay off the
+/// main thread). Every entry point checks that with a dispatch precondition, which is what makes the
+/// `@unchecked Sendable` (needed to hand the object to that queue's closures) actually hold.
+final class DiscordIPC: @unchecked Sendable {
+    let queue = DispatchQueue(label: "LockWidgets.discord")
     private var fd: Int32 = -1
     /// The handshake binds the socket to one application; a changed Client ID needs a new connection.
     private(set) var clientID: String?
-    var isConnected: Bool { fd >= 0 }
+    var isConnected: Bool { dispatchPrecondition(condition: .onQueue(queue)); return fd >= 0 }
 
-    func isConnected(as clientID: String) -> Bool { fd >= 0 && self.clientID == clientID }
+    func isConnected(as clientID: String) -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
+        return fd >= 0 && self.clientID == clientID
+    }
 
     func connect(clientID: String) -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
         close()
         let base = ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory()
         for index in 0..<10 {
@@ -53,6 +62,7 @@ final class DiscordIPC {
     }
 
     func setActivity(_ activity: [String: Any]?) -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
         let payload: [String: Any] = [
             "cmd": "SET_ACTIVITY",
             "args": ["pid": Int(getpid()), "activity": (activity as Any?) ?? NSNull()],
@@ -65,6 +75,7 @@ final class DiscordIPC {
     }
 
     func close() {
+        dispatchPrecondition(condition: .onQueue(queue))
         if fd >= 0 { Darwin.close(fd) }
         fd = -1
         clientID = nil
@@ -113,7 +124,6 @@ final class DiscordPresence: ObservableObject {
 
     @Published private(set) var status = "Off"
     private let ipc = DiscordIPC()
-    private let queue = DispatchQueue(label: "LockWidgets.discord")
     private var cancellables = Set<AnyCancellable>()
     private var lastSent: String?
     private var lastSendDate = Date.distantPast
@@ -152,7 +162,8 @@ final class DiscordPresence: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.lastSent = nil
-                self.queue.async { [ipc = self.ipc] in ipc.close() }
+                let ipc = self.ipc
+                ipc.queue.async { ipc.close() }
             }
             .store(in: &cancellables)
         workspace.publisher(for: NSWorkspace.didWakeNotification)
@@ -207,7 +218,7 @@ final class DiscordPresence: ObservableObject {
         let key = "\(info.title)|\(info.artist)|\(Int(start.timeIntervalSince1970 / 5))"
         let artKey = "\(info.artist)|\(info.album.isEmpty ? info.title : info.album)"
         if cfg.discordShowArt, let url = artCache[artKey] {
-            assets["large_image"] = url
+            if !url.isEmpty { assets["large_image"] = url } // "" = looked up, no artwork found
         } else if cfg.discordShowArt {
             lookUpArtwork(artist: info.artist, album: info.album.isEmpty ? info.title : info.album, cacheKey: artKey)
         }
@@ -220,7 +231,7 @@ final class DiscordPresence: ObservableObject {
         lastSent = key
         lastSendDate = Date()
         let ipc = self.ipc
-        queue.async {
+        ipc.queue.async {
             // Turning the integration off: clear the status on the connection we already have
             // (never open a new one just for that), then hang up.
             if key == nil {
@@ -252,9 +263,13 @@ final class DiscordPresence: ObservableObject {
                                  URLQueryItem(name: "entity", value: "album"), URLQueryItem(name: "limit", value: "1")]
         guard let url = components.url else { return }
         URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let first = (json["results"] as? [[String: Any]])?.first,
-                  let art = first["artworkUrl100"] as? String else { return }
+            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            guard let first = (json["results"] as? [[String: Any]])?.first,
+                  let art = first["artworkUrl100"] as? String else {
+                // No match: remember that, or every update for this album would search again.
+                DispatchQueue.main.async { MainActor.assumeIsolated { DiscordPresence.shared.artCache[cacheKey] = "" } }
+                return
+            }
             let big = art.replacingOccurrences(of: "100x100", with: "512x512")
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -269,7 +284,8 @@ final class DiscordPresence: ObservableObject {
 
     func reconnect() {
         lastSent = nil
-        queue.async { [ipc] in ipc.close() }
+        let ipc = self.ipc
+        ipc.queue.async { ipc.close() }
         scheduleUpdate()
     }
 }

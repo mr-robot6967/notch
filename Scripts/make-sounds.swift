@@ -1,4 +1,4 @@
-// Synthesizes Islet's lock / unlock sounds (original, iPhone-like "latch" clicks) as WAV files.
+// Synthesizes Notch's lock / unlock sounds (original, iPhone-like "latch" clicks) as WAV files.
 // Usage: swift Scripts/make-sounds.swift <output-dir>
 import Foundation
 
@@ -49,13 +49,21 @@ func writeWAV(_ samples: [Double], to url: URL) {
     print("wrote \(url.path)")
 }
 
-// Lock: a crisp, short two-stage latch — bright "tk-tk".
-var lock = [Double](repeating: 0, count: Int(0.14 * rate))
-click(into: &lock, at: 0.000, gain: 1.0, body: 1250, bodyDecay: 0.006, brightness: 0.85, noiseDecay: 0.0022)
-click(into: &lock, at: 0.026, gain: 0.8, body: 820, bodyDecay: 0.008, brightness: 0.7, noiseDecay: 0.0028)
+// Lock: one firm latch — a crisp, slightly dark click over a short low "thud" (the body of the
+// latch closing), like a phone's lock. Single hit, about 70 ms.
+var lock = [Double](repeating: 0, count: Int(0.12 * rate))
+click(into: &lock, at: 0.000, gain: 1.0, body: 980, bodyDecay: 0.005, brightness: 0.62, noiseDecay: 0.0018)
+for i in 0..<Int(0.07 * rate) {
+    let t = Double(i) / rate
+    // Low thud: ~165 Hz, very quick decay, slight downward pitch for weight.
+    let f = 165 - 40 * t / 0.07
+    lock[i] += 0.55 * min(1, t / 0.001) * sin(2 * .pi * f * t) * exp(-t / 0.016)
+}
 writeWAV(lock, to: outDir.appendingPathComponent("lock.wav"))
 
-// Unlock: a softer, lower single "tock".
-var unlock = [Double](repeating: 0, count: Int(0.12 * rate))
-click(into: &unlock, at: 0.000, gain: 1.0, body: 640, bodyDecay: 0.009, brightness: 0.55, noiseDecay: 0.003)
+// Unlock: a phone-style unlock — two quick, purely mechanical clicks ("tk-tk"), the second a
+// touch higher and brighter, ~30 ms apart. No tone, just the latch releasing.
+var unlock = [Double](repeating: 0, count: Int(0.11 * rate))
+click(into: &unlock, at: 0.000, gain: 0.85, body: 1500, bodyDecay: 0.0035, brightness: 0.78, noiseDecay: 0.0016)
+click(into: &unlock, at: 0.031, gain: 1.0, body: 1900, bodyDecay: 0.003, brightness: 0.9, noiseDecay: 0.0014)
 writeWAV(unlock, to: outDir.appendingPathComponent("unlock.wav"))

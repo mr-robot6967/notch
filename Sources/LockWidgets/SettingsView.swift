@@ -1073,21 +1073,6 @@ private struct NotchSettingsTab: View {
     @ObservedObject private var media = MediaController.shared
     @StateObject private var trust = TrustState()
 
-    private let activities: [(key: String, title: String, symbol: String)] = [
-        ("nowPlaying", "Now playing (album art + waveform)", "music.note"),
-        ("unlock", "Unlock", "lock.open.fill"),
-        ("volume", "Volume", "speaker.wave.2.fill"),
-        ("brightness", "Brightness", "sun.max.fill"),
-        ("charging", "Charging / unplugged", "bolt.fill"),
-        ("lowBattery", "Low battery", "battery.25percent"),
-        ("devices", "AirPods & Bluetooth devices connecting", "airpodspro"),
-        ("timer", "Timer", "timer"),
-        ("notifications", "Notifications from other apps", "app.badge.fill"),
-        ("calendar", "Upcoming calendar event", "calendar"),
-        ("focus", "Focus on / off", "moon.fill"),
-        ("lowPower", "Low Power Mode on / off", "leaf.fill"),
-    ]
-
     var body: some View {
         Form {
             Section {
@@ -1140,8 +1125,9 @@ private struct NotchSettingsTab: View {
             Section {
                 DisclosureGroup("More options") {
                     Picker("When nothing is playing", selection: $settings.config.idleActivity) {
-                        Text("Show nothing").tag("none")
-                        Text("Show the weather").tag("weather")
+                        Text("Weather").tag("weather")
+                        Text("“Not playing”").tag("notPlaying")
+                        Text("Nothing (plain notch)").tag("none")
                     }
                     Picker("While locked", selection: $settings.config.lockedIndicator) {
                         Text("Nothing").tag("none")

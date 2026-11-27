@@ -79,7 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !settings.config.hasLaunchedBefore {
             settings.config.hasLaunchedBefore = true
-            settingsWindow?.show()
+            // On a fresh install the welcome opens instead; Settings behind it was a second window.
+            if settings.config.onboardingDone { settingsWindow?.show() }
         }
         enableLaunchAtLoginOnce()
 
@@ -111,7 +112,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Runs quietly in the background from login, so it never needs to be opened by hand.
     /// Done once, and only for the copy in /Applications (so dev builds don't register).
     private func enableLaunchAtLoginOnce() {
-        guard !settings.config.userDisabledLaunchAtLogin,
+        // Once only: removing Notch in System Settings › Login Items must stick (registering on every
+        // launch re-added it; only the in-app toggle set userDisabledLaunchAtLogin).
+        guard !settings.config.launchAtLoginConfigured, !settings.config.userDisabledLaunchAtLogin,
               Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
         settings.config.launchAtLoginConfigured = true
         if SMAppService.mainApp.status != .enabled {

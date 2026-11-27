@@ -103,19 +103,21 @@ public enum OpenMeteo {
     }
 
     private struct ForecastResponse: Decodable {
+        // Open-Meteo sends `null` for values a model doesn't have (some fields, the edges of the
+        // forecast range). Non-optional fields made one null fail the whole decode ("No weather").
         struct Current: Decodable {
             let temperature_2m: Double
-            let apparent_temperature: Double
-            let weather_code: Int
-            let is_day: Int
-            let relative_humidity_2m: Double
-            let wind_speed_10m: Double
+            let apparent_temperature: Double?
+            let weather_code: Int?
+            let is_day: Int?
+            let relative_humidity_2m: Double?
+            let wind_speed_10m: Double?
         }
         struct Daily: Decodable {
             let time: [String]
-            let weather_code: [Int]
-            let temperature_2m_max: [Double]
-            let temperature_2m_min: [Double]
+            let weather_code: [Int?]
+            let temperature_2m_max: [Double?]
+            let temperature_2m_min: [Double?]
         }
         let timezone: String?
         let current: Current
@@ -132,19 +134,21 @@ public enum OpenMeteo {
         let count = min(r.daily.time.count, r.daily.weather_code.count, r.daily.temperature_2m_max.count, r.daily.temperature_2m_min.count)
         var days: [DailyForecast] = []
         for i in 0..<count {
-            guard let date = fmt.date(from: r.daily.time[i]) else { continue }
-            days.append(DailyForecast(date: date, high: r.daily.temperature_2m_max[i], low: r.daily.temperature_2m_min[i], code: r.daily.weather_code[i]))
+            // Days with a missing value are skipped rather than failing the forecast.
+            guard let date = fmt.date(from: r.daily.time[i]), let high = r.daily.temperature_2m_max[i],
+                  let low = r.daily.temperature_2m_min[i], let code = r.daily.weather_code[i] else { continue }
+            days.append(DailyForecast(date: date, high: high, low: low, code: code))
         }
         guard let today = days.first else { throw WeatherError.badResponse }
 
         return WeatherSnapshot(
             locationName: locationName,
             temperature: r.current.temperature_2m,
-            apparentTemperature: r.current.apparent_temperature,
-            code: r.current.weather_code,
-            isDay: r.current.is_day == 1,
-            humidity: r.current.relative_humidity_2m,
-            windSpeed: r.current.wind_speed_10m,
+            apparentTemperature: r.current.apparent_temperature ?? r.current.temperature_2m,
+            code: r.current.weather_code ?? today.code,
+            isDay: (r.current.is_day ?? 1) == 1,
+            humidity: r.current.relative_humidity_2m ?? 0,
+            windSpeed: r.current.wind_speed_10m ?? 0,
             high: today.high,
             low: today.low,
             daily: days,

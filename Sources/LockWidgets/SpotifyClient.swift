@@ -49,9 +49,8 @@ final class SpotifyClient: ObservableObject {
     /// Every ID the playing song is known by: the copy being played and, for relinked tracks, the
     /// original it was relinked from (Liked Songs may hold either).
     private var currentTrackIDs: [String] = []
-    private var likeTimer: Timer?
     /// Liked state per track ID with when it was checked (one API call per song, not per minute).
-    private var likedCache: [String: (liked: Bool, at: Date)] = [:]
+    private var likedCache: [String: (liked: Bool, matched: String?, at: Date)] = [:]
     private var lastIslandCheck = Date.distantPast
     /// Liked Songs indexed by recording (ISRC) and by title + artist → saved track ID, so a song
     /// liked from another release (single vs album) shows as liked, like the Spotify app does.
@@ -191,11 +190,6 @@ final class SpotifyClient: ObservableObject {
                 }
             }
             .store(in: &cancellables)
-        MediaController.shared.$info
-            .map { "\($0?.bundleIdentifier ?? "")|\($0?.isPlaying == true)" }
-            .removeDuplicates()
-            .sink { [weak self] _ in DispatchQueue.main.async { self?.updateLikeTimer() } }
-            .store(in: &cancellables)
         // Opening the island re-checks the heart.
         NotchModel.shared.$expanded
             .removeDuplicates()
@@ -237,10 +231,25 @@ final class SpotifyClient: ObservableObject {
 
     func disconnect() {
         Self.deleteRefreshToken()
+        listener?.cancel()
+        listener = nil
         accessToken = nil
+        tokenExpiry = .distantPast
         connected = false
         isLiked = false
         devices = []
+        // Forget everything tied to this account, so connecting another one never shows its hearts.
+        currentTrackID = nil
+        currentTrackIDs = []
+        currentIndexKeys = nil
+        matchedSavedID = nil
+        likedKey = ""
+        likedCache = [:]
+        likedByISRC = [:]
+        likedByKey = [:]
+        likedIndexAt = nil
+        likedFullAt = nil
+        try? FileManager.default.removeItem(at: Self.likedCacheURL)
         status = "Not connected"
     }
 
@@ -283,6 +292,17 @@ final class SpotifyClient: ObservableObject {
                     }
                     Task { await client.exchange(code: code, clientID: clientID) }
                 }
+            }
+        }
+        // Binding the port fails asynchronously (e.g. it's in use); say so instead of "Waiting…" for 3 min.
+        listener.stateUpdateHandler = { [weak listener] state in
+            guard case .failed = state else { return }
+            MainActor.assumeIsolated {
+                let client = SpotifyClient.shared
+                guard let listener, client.listener === listener else { return }
+                listener.cancel()
+                client.listener = nil
+                client.status = "Couldn't open the local callback (port 47321 busy?)"
             }
         }
         listener.start(queue: .main)
@@ -328,6 +348,9 @@ final class SpotifyClient: ObservableObject {
         let clientID = AppSettings.shared.config.spotifyClientID.trimmingCharacters(in: .whitespaces)
         let (token, code) = await tokenRequestWithStatus(["grant_type": "refresh_token", "refresh_token": refresh, "client_id": clientID])
         spotifyLog.notice("Spotify: token refresh → \(code)")
+        // Disconnected while the request was in flight: don't save the rotated refresh token
+        // (that would silently sign the user back in on the next launch).
+        guard connected else { return false }
         guard let token else {
             // Only a rejected refresh token means signed out; network trouble just fails this call.
             if code == 400 || code == 401 {
@@ -365,24 +388,25 @@ final class SpotifyClient: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any], code)
     }
 
-    private func legacyTokenRequest(_ fields: [String: String]) async -> [String: Any]? {
-        var request = URLRequest(url: URL(string: "https://accounts.spotify.com/api/token")!)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        var c = URLComponents()
-        c.queryItems = fields.map { URLQueryItem(name: $0.key, value: $0.value) }
-        request.httpBody = c.percentEncodedQuery?.data(using: .utf8)
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    }
-
     // MARK: API
 
     /// Spotify rate-limits this app's key (development-mode apps get a small quota). After a 429 we
     /// stop calling until the time it asks for; hammering it kept the quota exhausted, so every
     /// like check failed and the heart showed "not liked".
-    private var blockedUntil = Date.distantPast { didSet { busyUntil = blockedUntil > Date() ? blockedUntil : nil } }
+    private var blockedUntil = Date.distantPast {
+        didSet {
+            busyUntil = blockedUntil > Date() ? blockedUntil : nil
+            // There's no polling, so nothing else would clear "busy" once the pause ends: the heart
+            // and Settings would say "busy" until the next request. Clear it when the pause is over.
+            guard let until = busyUntil else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + until.timeIntervalSinceNow + 0.5) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.blockedUntil <= Date() else { return }
+                    self.busyUntil = nil
+                }
+            }
+        }
+    }
     /// Set while Spotify calls are paused (rate limit or our own budget) — shown on the heart.
     @Published private(set) var busyUntil: Date?
     /// Our own ceiling, well under what one key allows, so a single user can never exhaust it.
@@ -461,6 +485,9 @@ final class SpotifyClient: ObservableObject {
         // One check per song: reuse a recent answer for the same track instead of asking again.
         if let cached = likedCache[id], Date().timeIntervalSince(cached.at) < 600 {
             isLiked = cached.liked
+            // The saved other-release version belongs to this song, not to whichever was checked last
+            // (a stale one would be deleted by the next unlike).
+            matchedSavedID = cached.matched
             if let info = MediaController.shared.info { likedKey = "\(info.title)|\(info.artist)" }
             return true
         }
@@ -477,7 +504,7 @@ final class SpotifyClient: ObservableObject {
             return false
         }
         if let info = MediaController.shared.info { likedKey = "\(info.title)|\(info.artist)" }
-        likedCache[id] = (isLiked, Date())
+        likedCache[id] = (isLiked, matchedSavedID, Date())
         return true
     }
 
@@ -491,30 +518,8 @@ final class SpotifyClient: ObservableObject {
         return flags.contains(true)
     }
 
-    /// While Spotify plays, re-check every 20 s so a ♥ added or removed in Spotify itself shows here.
-    private func updateLikeTimer() {
-        // No background polling any more: song changes, opening the island (throttled) and wake
-        // re-check. Keeps each user far below Spotify's per-key limits.
-        likeTimer?.invalidate()
-        likeTimer = nil
-        return
-    }
-
-    private func legacyLikeTimer() {
-        let spotifyPlaying = connected && MediaController.shared.info?.bundleIdentifier == "com.spotify.client"
-            && MediaController.shared.info?.isPlaying == true
-        if spotifyPlaying, likeTimer == nil {
-            let timer = Timer(timeInterval: 120, repeats: true) { _ in
-                MainActor.assumeIsolated { Task { await SpotifyClient.shared.refreshTrackState() } }
-            }
-            timer.tolerance = 20
-            RunLoop.main.add(timer, forMode: .common)
-            likeTimer = timer
-        } else if !spotifyPlaying {
-            likeTimer?.invalidate()
-            likeTimer = nil
-        }
-    }
+    // No background polling of the heart: song changes, opening the island (throttled) and wake
+    // re-check it. Keeps each user far below Spotify's per-key limits.
 
     // Shuffle/repeat: Spotify's AppleScript setter no longer works (it has three shuffle modes now),
     // so with the connection we use the Web API, which sets and reports them reliably.
@@ -548,19 +553,16 @@ final class SpotifyClient: ObservableObject {
         connected = true
         guard let before = await playbackModes() else { print("spotify: player state unavailable"); return }
         print("spotify: before shuffle=\(before.shuffle) repeat=\(before.repeatState)")
-        let (sc, sd) = await api("PUT", "/me/player/shuffle?state=\(!before.shuffle)")
-        print("spotify: PUT shuffle → \(sc) \(sd.flatMap { String(data: $0, encoding: .utf8) }?.prefix(200) ?? "")")
-        let (lc, ld) = await api("GET", "/me/tracks?limit=1")
-        print("spotify: GET /me/tracks → \(lc) \(ld.flatMap { String(data: $0, encoding: .utf8) }?.prefix(160) ?? "")")
-        let (cc, cd) = await api("GET", "/me/library/contains?uris=spotify%3Atrack%3A5PvwPy5eRO8BPwpRzCHK3D")
-        print("spotify: library/contains → \(cc) \(cd.flatMap { String(data: $0, encoding: .utf8) }?.prefix(160) ?? "")")
-        await setShuffle(before.shuffle)
-        return
-        let set1 = await setShuffle(!before.shuffle)
+        // Flip: print the raw status code so a refusal (403 premium-only, 404 no device…) is visible.
+        let (flipCode, flipData) = await api("PUT", "/me/player/shuffle?state=\(!before.shuffle)")
+        let flipBody = flipData.flatMap { String(data: $0, encoding: .utf8) }?.prefix(200) ?? ""
+        print("spotify: PUT shuffle=\(!before.shuffle) → \(flipCode) \(flipBody)")
         try? await Task.sleep(nanoseconds: 700_000_000)
         let mid = await playbackModes()
-        print("spotify: set shuffle \(!before.shuffle) → \(set1 ? "ok" : "failed"), now shuffle=\(mid?.shuffle.description ?? "?")")
-        await setShuffle(before.shuffle)
+        print("spotify: read back shuffle=\(mid?.shuffle.description ?? "?")")
+        // Always restore, even if the flip looked refused (it may have applied anyway).
+        let (restoreCode, _) = await api("PUT", "/me/player/shuffle?state=\(before.shuffle)")
+        print("spotify: PUT shuffle=\(before.shuffle) (restore) → \(restoreCode)")
         try? await Task.sleep(nanoseconds: 700_000_000)
         print("spotify: restored shuffle=\((await playbackModes())?.shuffle.description ?? "?")")
     }
@@ -601,12 +603,13 @@ final class SpotifyClient: ObservableObject {
         // Unliking a song saved under another release removes that saved version too.
         if !saving, let saved = matchedSavedID, saved != id {
             let uri = "spotify:track:\(saved)"
-            _ = await api("DELETE", "/me/library?uris=\(uri.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uri)")
-            code = 200
+            let (savedCode, _) = await api("DELETE", "/me/library?uris=\(uri.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uri)")
+            // Only report success if removing that saved version actually worked.
+            if (200...299).contains(savedCode) { code = savedCode }
         }
         if (200...299).contains(code) {
             isLiked = saving
-            likedCache[id] = (saving, Date())
+            likedCache[id] = (saving, nil, Date())
             if let keys = currentIndexKeys {
                 if saving {
                     likedByKey[keys.key] = id

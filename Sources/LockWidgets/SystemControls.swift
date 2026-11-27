@@ -203,6 +203,14 @@ final class AudioDevices: ObservableObject {
         return false
     }
 
+    /// The default output has a settable mute (HDMI/DisplayPort outputs often don't).
+    static func canSetMute() -> Bool {
+        let device = defaultOutput()
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        var settable: DarwinBoolean = false
+        return AudioObjectHasProperty(device, &a) && AudioObjectIsPropertySettable(device, &a, &settable) == noErr && settable.boolValue
+    }
+
     static func isMuted() -> Bool {
         let device = defaultOutput()
         var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
@@ -474,9 +482,12 @@ final class MediaKeyTap {
         let disabled = MainActor.assumeIsolated { AppSettings.shared.config.disabledActivities }
         if [0, 1, 7].contains(code) && disabled.contains("volume") { return false }
         if [0, 1].contains(code) && !MainActor.assumeIsolated({ AudioDevices.canSetVolume() }) { return false }
+        // Same for mute: without a settable mute property the key was swallowed and did nothing.
+        if code == 7 && !MainActor.assumeIsolated({ AudioDevices.canSetMute() }) { return false }
         if [2, 3].contains(code) && (disabled.contains("brightness") || Brightness.get() == nil) { return false }
         guard isDown else { return true } // swallow key-up too
         let fine = ns.modifierFlags.contains(.option) && ns.modifierFlags.contains(.shift)
+        let shift = ns.modifierFlags.contains(.shift)
         let step: Float = fine ? 1.0 / 64.0 : 1.0 / 16.0
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
@@ -485,6 +496,7 @@ final class MediaKeyTap {
                     MediaKeyTap.lastVolumeKeyAt = Date()
                     let v = min(1, max(0, AudioDevices.volume() + (code == 0 ? step : -step)))
                     AudioDevices.setVolume((v * 64).rounded() / 64)
+                    VolumeFeedback.play(shiftHeld: shift)
                     // At 0 % / 100 % CoreAudio reports no change, so show the level (and limit haptic) here.
                     if v <= 0 || v >= 1 {
                         NotchModel.shared.flash(.volume(level: v, muted: AudioDevices.isMuted()), seconds: 1.6)
@@ -505,5 +517,25 @@ final class MediaKeyTap {
             }
         }
         return true
+    }
+}
+
+/// macOS's "Play feedback when volume is changed" pop. Because the key tap sets the volume itself
+/// (to show the island instead of Apple's pop-up), macOS no longer plays it — so we do, using the
+/// system's own sound, whenever that setting is on (Shift inverts it, exactly like macOS).
+@MainActor
+enum VolumeFeedback {
+    private static let sound: NSSound? = NSSound(contentsOfFile:
+        "/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff", byReference: true)
+    private static var lastPlayed = Date.distantPast
+
+    static func play(shiftHeld: Bool) {
+        let enabled = (UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?["com.apple.sound.beep.feedback"] as? Int ?? 0) == 1
+        guard enabled != shiftHeld, !AudioDevices.isMuted(), let sound else { return }
+        // Holding the key repeats fast; one pop per ~120 ms is what macOS does too.
+        guard Date().timeIntervalSince(lastPlayed) > 0.12 else { return }
+        lastPlayed = Date()
+        sound.stop()
+        sound.play()
     }
 }
