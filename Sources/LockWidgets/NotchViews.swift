@@ -11,6 +11,7 @@ struct NotchRootView: View {
     @ObservedObject private var media = MediaController.shared
     @ObservedObject private var timer = NotchTimer.shared
     @ObservedObject private var store = WidgetStore.shared
+    @ObservedObject private var watching = WatchingDetector.shared
 
     var body: some View {
         let size = controller.islandSize()
@@ -289,6 +290,7 @@ private struct CompactActivity: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject private var media = MediaController.shared
     @ObservedObject private var timer = NotchTimer.shared
+    @ObservedObject private var watching = WatchingDetector.shared
 
     var body: some View {
         HStack(spacing: 0) {
@@ -305,6 +307,17 @@ private struct CompactActivity: View {
         switch content {
         case .nowPlaying:
             FlippingArtwork(size: 20, radius: 5)
+        case .watching:
+            HStack(spacing: 6) {
+                Image(systemName: watching.service.symbol).font(.system(size: 13, weight: .semibold))
+                    .contentTransition(.symbolEffect(.replace))
+                // Show the service here only when the title (on the right) is the real show; a bare
+                // service name shows on the right instead, so it isn't duplicated.
+                if watching.hasDistinctTitle {
+                    Text(watching.service.name).font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.7)).lineLimit(1).fixedSize()
+                }
+            }
         case .timer, .transient(.timerDone):
             Image(systemName: "timer").foregroundStyle(.orange)
         case .hud(let kind, _, let muted):
@@ -358,6 +371,11 @@ private struct CompactActivity: View {
         switch content {
         case .nowPlaying:
             WaveformBars(color: media.artworkColor, playing: media.info?.isPlaying == true, count: 5, maxHeight: 12, barWidth: 2.5, gap: 1)
+        case .watching:
+            Text(watching.hasDistinctTitle ? watching.title : watching.service.name)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .lineLimit(1).truncationMode(.tail)
+                .frame(maxWidth: 150, alignment: .trailing)
         case .timer:
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 Text(formatDuration(timer.remaining(at: ctx.date))).monospacedDigit().foregroundStyle(.orange).lineLimit(1).fixedSize()

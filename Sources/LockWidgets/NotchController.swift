@@ -828,11 +828,28 @@ final class NotchController {
 
         installEventMonitors()
         reposition()
+
+        // A video's own fullscreen button (Netflix/YouTube going fullscreen inside the browser)
+        // changes neither the Space nor the frontmost app, so the observers above miss it and the
+        // island would sit over the video. While media is playing (or while already hidden for
+        // fullscreen, to catch the exit), re-check once a second. Honours "Hide in fullscreen apps".
+        let fsTimer = Timer(timeInterval: 1.0, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let self = AppDelegate.shared?.notch, self.settings.config.notchEnabled,
+                      self.settings.config.notchHideInFullscreen else { return }
+                guard MediaController.shared.info?.isPlaying == true || self.hiddenForFullscreen else { return }
+                self.updateFullscreenHiding()
+            }
+        }
+        fsTimer.tolerance = 0.3
+        RunLoop.main.add(fsTimer, forMode: .common)
+        self.fullscreenPollTimer = fsTimer
     }
 
     private(set) var hiddenForFullscreen = false
     private var missionControlOpen = false
     private var missionControlTimer: Timer?
+    private var fullscreenPollTimer: Timer?
 
     /// Mission Control has no public notification; while it's open the Dock shows a full-screen
     /// window on layer 20. A cheap check a few times a second; the island hides while it's there.
@@ -1082,6 +1099,7 @@ final class NotchController {
         switch content {
         case .idle: return CGSize(width: g.width + 6 * k * grow, height: g.height + 2 * k * grow)
         case .nowPlaying: return CGSize(width: g.width + 2 * 37 * k + 4 * k * grow, height: g.height + 1.5 * k * grow)
+        case .watching: return CGSize(width: g.width + 2 * 100 * k, height: g.height + 1.5 * k * grow)
         case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * k, height: g.height)
         case .device: return CGSize(width: g.width + 2 * 82 * k, height: g.height)
         case .transient(.event): return CGSize(width: g.width + 2 * 110 * k, height: g.height)
@@ -1360,6 +1378,8 @@ enum NotchContent: Equatable {
     case device
     case timer
     case nowPlaying
+    /// Watching a video in a browser or streaming app (Netflix, YouTube…): show title + service.
+    case watching
     case idleWeather
     /// Idle: a dimmed note and "Not playing".
     case idleNotPlaying
@@ -1380,9 +1400,12 @@ enum NotchContent: Equatable {
         // Playing, or paused less than MediaController.pausedGrace (3 s) ago; after that the
         // paused song gives way to the idle content until playback resumes.
         let media = MediaController.shared
-        if let info = media.info, media.songIsRecent, !cfg.disabledActivities.contains("nowPlaying"),
+        if let info = media.info, media.songIsRecent,
            !(cfg.notchHideWhenSourceActive && info.bundleIdentifier == NSWorkspace.shared.frontmostApplication?.bundleIdentifier) {
-            return .nowPlaying
+            // Watching video in a browser/streaming app has its own toggle; music is left to the
+            // Now Playing activity (which keeps its own on/off switch).
+            if cfg.watchingEnabled, WatchingDetector.shared.isWatching { return .watching }
+            if !cfg.disabledActivities.contains("nowPlaying") { return .nowPlaying }
         }
         switch cfg.idleActivity {
         case "weather" where WidgetStore.shared.weather != nil: return .idleWeather

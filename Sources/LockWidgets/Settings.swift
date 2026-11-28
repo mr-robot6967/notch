@@ -145,6 +145,10 @@ struct Config: Codable, Equatable {
     var lockedIndicator: String = "icon"
     var lockIndicatorMigrated: Bool = true
     var cleanSongTitles: Bool = true
+    /// Show what the user is watching in a browser or streaming app (Netflix, Prime, YouTube…) in
+    /// the island, the way Now Playing works for music. New field: old configs merge over the
+    /// default (true), so loading them stays safe.
+    var watchingEnabled: Bool = true
     /// What the collapsed island shows when nothing is playing (or a song has been paused for a
     /// few seconds, MediaController.pausedGrace): "weather", "notPlaying" (a dimmed note + "Not playing") or "none" (plain notch).
     /// When nothing plays the island returns to its normal state (plain notch) unless the user picks
@@ -219,9 +223,6 @@ struct Config: Codable, Equatable {
     /// Hold notification banners (and optionally peeks) while Do Not Disturb / a Focus is on.
     var respectFocus: Bool = true
     var focusHoldsPeeks: Bool = false
-    var discordEnabled: Bool = false
-    var discordClientID: String = ""
-    var discordShowArt: Bool = false
     var spotifyClientID: String = ""
     /// Check GitHub for a newer Notch once a day.
     var autoCheckUpdates: Bool = true

@@ -97,7 +97,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .appearance: return "Glass, floating or cards — and colours that match your Mac."
         case .weather: return "Live weather and air quality from your location."
         case .batteries: return "Your Mac, AirPods and other Bluetooth devices."
-        case .integrations: return "Notifications, Discord and Spotify."
+        case .integrations: return "Notifications and Spotify."
         }
     }
 
@@ -135,7 +135,7 @@ struct SettingsSection: Identifiable {
         .init(title: "Activities", symbol: "bolt.badge.clock.fill", color: .orange, subtitle: "What pops up around the notch, and for how long.",
               pages: [(.battery, "Battery"), (.connectivity, "Devices"), (.focus, "Focus"), (.sound, "Sound"),
                       (.display, "Display"), (.calendar, "Calendar"), (.timing, "Timing")]),
-        .init(title: "Notifications & Apps", symbol: "app.badge.fill", color: .red, subtitle: "Notifications, replies, Spotify and Discord.",
+        .init(title: "Notifications & Apps", symbol: "app.badge.fill", color: .red, subtitle: "Notifications, replies and Spotify.",
               pages: [(.integrations, "Notifications & Apps")]),
         .init(title: "Lock Screen", symbol: "lock.fill", color: .indigo, subtitle: "Widgets and player on the lock screen.",
               pages: [(.lockScreen, "Lock Screen"), (.placement, "Layout")]),
@@ -1170,14 +1170,12 @@ private struct NotchSettingsTab: View {
 
 @MainActor
 private final class Drafts: ObservableObject {
-    @Published var discordID = AppSettings.shared.config.discordClientID
     @Published var spotifyID = AppSettings.shared.config.spotifyClientID
 }
 
 private struct IntegrationsTab: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject private var notifications = NotificationMirror.shared
-    @ObservedObject private var discord = DiscordPresence.shared
     @ObservedObject private var spotify = SpotifyClient.shared
     @StateObject private var drafts = Drafts()
 
@@ -1272,30 +1270,6 @@ private struct IntegrationsTab: View {
                     Text("Banner pops up. List only collects quietly. Off hides it.")
                 }
 
-            }
-
-            Section {
-                Toggle("Show “Listening to …” on Discord", isOn: $settings.config.discordEnabled)
-                HStack {
-                    TextField("Discord Application ID", text: $drafts.discordID)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Save") {
-                        // Write the trimmed ID back too, or Save stays enabled for a pasted trailing space.
-                        drafts.discordID = drafts.discordID.trimmingCharacters(in: .whitespacesAndNewlines)
-                        settings.config.discordClientID = drafts.discordID
-                        discord.reconnect()
-                    }
-                    .disabled(drafts.discordID == settings.config.discordClientID)
-                }
-                Toggle("Show album art (looks the album up with the iTunes Search API)", isOn: $settings.config.discordShowArt)
-                LabeledContent("Status", value: discord.status)
-                Button("Open the Discord Developer Portal…") {
-                    NSWorkspace.shared.open(URL(string: "https://discord.com/developers/applications")!)
-                }
-            } header: {
-                Text("Discord")
-            } footer: {
-                Text("1. In the Developer Portal click New Application and name it what you want Discord to show (e.g. “Music”). 2. Copy the Application ID from General Information and paste it here. The Discord app must be running. This only sets your status — it never reads your messages.")
             }
 
             Section {
@@ -1563,6 +1537,18 @@ private struct NowPlayingSettingsPage: View {
                 Toggle("Hide while the playing app is in front", isOn: $settings.config.notchHideWhenSourceActive)
                 Toggle("Click the song to open the app playing it", isOn: $settings.config.openSourceOnTap)
                 Toggle("Show the app's icon on the album art", isOn: $settings.config.showSourceBadge)
+            }
+            Section {
+                Toggle("Show what I'm watching (Netflix, Prime, YouTube…)", isOn: $settings.config.watchingEnabled)
+            } footer: {
+                Text("Shows the service for video in any browser or a streaming app. The exact show title needs Safari, Chrome, Brave or Edge with \"Allow JavaScript from Apple Events\" turned on, and isn't available in Firefox or DuckDuckGo. YouTube always shows the video title.")
+            }
+            if settings.config.watchingEnabled, let hint = WatchingDetector.shared.needsAppleEvents {
+                Section("Now Watching") {
+                    Label(hint, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("This lets Notch read the show title from the player tab. Only the streaming tab is read.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             if let hint = YTMusicBridge.shared.needsAppleEvents {
                 Section("YouTube Music") {
