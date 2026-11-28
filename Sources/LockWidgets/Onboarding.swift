@@ -269,8 +269,6 @@ private struct OnboardingView: View {
                            detail: "Show levels in the island", isOn: $settings.config.replaceSystemHUD)
                 FeatureRow(symbol: "calendar", color: .orange, title: "Calendar",
                            detail: "A heads-up before your next event", isOn: $settings.config.calendarPeek)
-                FeatureRow(symbol: "square.grid.2x2.fill", color: .teal, title: "Desktop Widgets",
-                           detail: "Widgets on your desktop", isOn: $settings.config.desktopWidgetsEnabled)
                 FeatureRow(symbol: "heart.fill", color: .green, title: "Spotify Likes & Devices",
                            detail: "Like songs and switch speakers (free, 2-minute setup)", isOn: $state.wantsSpotify, last: true)
             }
@@ -322,7 +320,7 @@ private struct OnboardingView: View {
             rows.append(.init(symbol: "externaldrive.fill", color: .blue, title: "Full Disk Access", detail: "To read notifications and Focus",
                               granted: state.fullDisk) { NotificationMirror.openFullDiskAccessSettings() })
         }
-        if cfg.lockScreenWidgets || cfg.desktopWidgetsEnabled {
+        if cfg.lockScreenWidgets {
             rows.append(.init(symbol: "location.fill", color: .blue, title: "Location", detail: "For local weather",
                               granted: state.location == .authorizedAlways || state.location == .authorized) {
                 if state.location == .notDetermined { state.locationManager.requestWhenInUseAuthorization() }

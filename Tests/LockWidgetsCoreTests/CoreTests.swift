@@ -146,3 +146,18 @@ import Testing
     let single = EarbudCombine.combine([DeviceBattery(name: "My AirPods", kind: .earbudLeft, level: 50, component: "L")])
     #expect(single.count == 1 && single[0].kind == .earbudLeft)
 }
+
+@Test func oneWholeDeviceReadingAndNoneForSplitDevices() {
+    let json = """
+    {"SPBluetoothDataType":[{"device_connected":[
+        {"Beats Studio":{"device_minorType":"Headphones","device_batteryLevelMain":"70%","device_batteryLevel":"70%"}},
+        {"My AirPods":{"device_minorType":"Headphones","device_batteryLevelMain":"60%","device_batteryLevelLeft":"80%","device_batteryLevelRight":"75%","device_batteryLevelCase":"40%"}}
+    ]}]}
+    """
+    let devices = BluetoothParser.parse(Data(json.utf8))
+    // Ids must be unique: they key the SwiftUI lists and the hide-device setting.
+    #expect(Set(devices.map(\.id)).count == devices.count)
+    #expect(devices.filter { $0.name == "Beats Studio" }.count == 1)
+    #expect(devices.filter { $0.name == "My AirPods" }.count == 3)
+    #expect(!devices.contains { $0.name == "My AirPods" && $0.component == nil })
+}

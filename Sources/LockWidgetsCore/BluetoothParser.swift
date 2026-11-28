@@ -25,8 +25,18 @@ public enum BluetoothParser {
                     guard let info = value as? [String: Any] else { continue }
                     let minor = info["device_minorType"] as? String ?? ""
                     let baseKind = DeviceKind.guess(from: minor.isEmpty ? name : minor)
+                    // Main and plain level are the same reading under two names, and split devices
+                    // (AirPods) may add one next to L/R/Case: taking every match gave two entries with
+                    // the same id (duplicate ForEach ids, a doubled gauge). One whole-device reading at
+                    // most, and none when the device reports its parts.
+                    let isSplit = fields.contains { $0.component != nil && info[$0.key].flatMap(percent) != nil }
+                    var hasWhole = false
                     for field in fields {
                         guard let raw = info[field.key], let level = percent(raw) else { continue }
+                        if field.component == nil {
+                            if isSplit || hasWhole { continue }
+                            hasWhole = true
+                        }
                         out.append(DeviceBattery(
                             name: name,
                             kind: field.kind ?? baseKind,

@@ -138,6 +138,11 @@ final class MediaController: ObservableObject {
     /// Dominant colour of the artwork, used as an accent in the player.
     @Published private(set) var artworkColor: Color = .white
     @Published private(set) var usingHelper = false
+    /// Apple Music's "Favorite" (formerly "Love") for the current track. Music ignores the system
+    /// media "like" command, so it's read and set through AppleScript instead.
+    @Published private(set) var musicFavorited = false
+    /// A Favorite change Music hasn't confirmed yet (see `like()`), and until when to wait for it.
+    private var musicFavoritePending: (target: Bool, until: Date)?
 
     private var helper: Process?
     private var helperInput: FileHandle?
@@ -274,11 +279,20 @@ final class MediaController: ObservableObject {
         YTMusicBridge.browser(for: info?.bundleIdentifier) != nil && YTMusicBridge.shared.active
     }
 
+    /// Spotify/Music don't report shuffle/repeat to Now Playing, so every helper update re-applies
+    /// `appModes`; record an optimistic change there too, or the next update (often caused by the
+    /// toggle itself) flipped the button back until the read-back arrived.
+    private func keepOptimisticModes(_ bundle: String) {
+        guard let current = info, current.bundleIdentifier == bundle else { return }
+        appModes = (bundle, current.shuffleMode, current.repeatMode)
+    }
+
     func toggleShuffle() {
         if isYouTubeMusic { YTMusicBridge.shared.shuffle(); return }
         if let player = scriptablePlayer(), player.app == "Spotify", SpotifyClient.shared.connected {
             let turnOn = !(info?.shuffleOn ?? false)
             if var current = info { current.shuffleMode = turnOn ? 2 : 1; info = current }
+            keepOptimisticModes(player.bundle)
             Task { @MainActor in
                 await SpotifyClient.shared.setShuffle(turnOn)
                 try? await Task.sleep(nanoseconds: 400_000_000)
@@ -288,6 +302,7 @@ final class MediaController: ObservableObject {
         }
         if let player = scriptablePlayer() {
             if var current = info { current.shuffleMode = current.shuffleOn ? 1 : 2; info = current }
+            keepOptimisticModes(player.bundle)
             runPlayerScript(player.app == "Spotify"
                 ? Self.ifRunning("Spotify", "set shuffling to not shuffling")
                 : Self.ifRunning("Music", "set shuffle enabled to not shuffle enabled"))
@@ -305,6 +320,7 @@ final class MediaController: ObservableObject {
             let mode = info?.repeatMode ?? 1
             let next = mode == 1 ? 3 : (mode == 3 ? 2 : 1)
             if var current = info { current.repeatMode = next; info = current }
+            keepOptimisticModes(player.bundle)
             Task { @MainActor in
                 await SpotifyClient.shared.setRepeat(next == 3 ? "context" : (next == 2 ? "track" : "off"))
                 try? await Task.sleep(nanoseconds: 400_000_000)
@@ -315,10 +331,12 @@ final class MediaController: ObservableObject {
         if let player = scriptablePlayer() {
             if player.app == "Spotify" {
                 if var current = info { current.repeatMode = current.repeatOn ? 1 : 3; info = current }
+                keepOptimisticModes(player.bundle)
                 runPlayerScript(Self.ifRunning("Spotify", "set repeating to not repeating"))
             } else {
                 // Music cycles Off → All → One → Off, like its own button.
                 if var current = info { current.repeatMode = current.repeatMode == 3 ? 2 : (current.repeatMode == 2 ? 1 : 3); info = current }
+                keepOptimisticModes(player.bundle)
                 runPlayerScript(Self.ifRunning("Music", """
                     if song repeat is off then
                         set song repeat to all
@@ -340,6 +358,20 @@ final class MediaController: ObservableObject {
     func like() {
         if info?.bundleIdentifier == "com.spotify.client", SpotifyClient.shared.connected {
             Task { await SpotifyClient.shared.toggleLike() }
+        } else if info?.bundleIdentifier == "com.apple.Music" {
+            // Optimistic heart; the read-backs confirm what Music actually saved. For catalogue
+            // ("URL") tracks Music needs ~5–10 s to report a new Favorite, so disagreeing read-backs
+            // are retried until `musicFavoritePending` expires instead of flipping the heart back.
+            let target = !musicFavorited
+            musicFavorited = target
+            musicFavoritePending = (target, Date().addingTimeInterval(14))
+            let source = Self.ifRunning("Music", Self.musicSetFavoriteBody(target))
+            scriptQueue.async {
+                _ = Self.runScript(source)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    MainActor.assumeIsolated { MediaController.shared.refreshMusicFavorite() }
+                }
+            }
         } else if isYouTubeMusic {
             YTMusicBridge.shared.toggleLike()
         } else if usingHelper {
@@ -555,6 +587,13 @@ final class MediaController: ObservableObject {
                 MainActor.assumeIsolated { YTMusicBridge.shared.refresh() }
             }
         }
+        if songChanged, new.bundleIdentifier == "com.apple.Music" {
+            musicFavorited = false
+            musicFavoritePending = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                MainActor.assumeIsolated { MediaController.shared.refreshMusicFavorite() }
+            }
+        }
         if songChanged, Self.scriptablePlayers[new.bundleIdentifier ?? ""] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 MainActor.assumeIsolated { MediaController.shared.refreshAppModes() }
@@ -627,6 +666,12 @@ final class MediaController: ObservableObject {
                               duration: durationMS / 1000, elapsed: (u["Playback Position"] as? Double) ?? 0,
                               elapsedDate: Date(), rate: 1, bundleIdentifier: bundle, appName: app)
         if changedTrack { fetchFallbackArtwork(app: app) }
+        if changedTrack, bundle == "com.apple.Music" {
+            // As in handleHelper: the heart belonged to the previous song.
+            musicFavorited = false
+            musicFavoritePending = nil
+            refreshMusicFavorite()
+        }
     }
 
     private func fetchFallbackArtwork(app: String) {
@@ -640,6 +685,86 @@ final class MediaController: ObservableObject {
                 image = NSImage(data: data)
             }
             DispatchQueue.main.async { MainActor.assumeIsolated { MediaController.shared.setArtwork(image) } }
+        }
+    }
+
+    /// Sets Music's Favorite for the current track. Tested on macOS 27 with Music:
+    /// - `set favorited of current track` works for library tracks, and also *favourites*
+    ///   catalogue (streamed "URL") tracks — Music adds them to the library a few seconds later.
+    /// - It does NOT un-favourite a catalogue track (only its local flag changes); clearing the
+    ///   Favorite on the library copy ("shared track", same name/artist/album) does, at once.
+    /// Track properties are read inside the script, never interpolated into it.
+    nonisolated static func musicSetFavoriteBody(_ target: Bool) -> String {
+        """
+        set t to current track
+        try
+            set favorited of t to \(target)
+        on error
+            try
+                set loved of t to \(target)
+            end try
+        end try
+        try
+            set n to name of t
+            set a to artist of t
+            set al to album of t
+            repeat with m in (every track of library playlist 1 whose name is n and artist is a and album is al)
+                try
+                    if favorited of m is not \(target) then set favorited of m to \(target)
+                end try
+            end repeat
+        end try
+        """
+    }
+
+    /// The library copy of the current track holds the real Favorite; a catalogue track's own flag
+    /// is only a local cache (and keeps a value set by a script even when Music didn't save it).
+    nonisolated static let musicReadFavoriteBody = """
+        set t to current track
+        try
+            set n to name of t
+            set a to artist of t
+            set al to album of t
+            set matches to (every track of library playlist 1 whose name is n and artist is a and album is al)
+            if (count of matches) > 0 then
+                repeat with m in matches
+                    if favorited of m then return true
+                end repeat
+                return false
+            end if
+        end try
+        try
+            return favorited of t
+        on error
+            return loved of t
+        end try
+        """
+
+    /// Reads whether Music's current track is a Favorite ("favorited" on macOS 14+, "loved" before).
+    func refreshMusicFavorite() {
+        guard info?.bundleIdentifier == "com.apple.Music" else { return }
+        let title = info?.title
+        let source = Self.ifRunning("Music", Self.musicReadFavoriteBody)
+        scriptQueue.async {
+            // A failed read (e.g. between tracks) leaves the heart as it is.
+            guard let value = Self.runScript(source)?.booleanValue else { return }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let m = MediaController.shared
+                    guard m.info?.bundleIdentifier == "com.apple.Music", m.info?.title == title else { return }
+                    if let pending = m.musicFavoritePending {
+                        if value != pending.target, Date() < pending.until {
+                            // Music hasn't caught up yet (catalogue tracks take several seconds).
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                MainActor.assumeIsolated { MediaController.shared.refreshMusicFavorite() }
+                            }
+                            return
+                        }
+                        m.musicFavoritePending = nil
+                    }
+                    if m.musicFavorited != value { m.musicFavorited = value }
+                }
+            }
         }
     }
 

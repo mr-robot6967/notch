@@ -146,6 +146,9 @@ struct Config: Codable, Equatable {
     var activityDurations: [String: Double] = [:]
     /// Waveform colour: "monochrome", "colored" (from the album art) or "gradient".
     var waveformColor: String = "colored"
+    /// Drive the waveform from the actual audio (system-audio tap, macOS 14.2+). New field: old
+    /// configs merge over the default (true).
+    var waveformReactsToAudio: Bool = true
     /// What the island shows while the Mac is locked: "none", "icon" or "glow".
     var lockedIndicator: String = "icon"
     var lockIndicatorMigrated: Bool = true
@@ -178,11 +181,6 @@ struct Config: Codable, Equatable {
     var playerPlacement: ScreenPlacement? = nil
     /// Free arrangement: every lock-screen widget has its own position.
     var freeLayout: Bool = false
-    // Optional desktop widgets
-    var desktopWidgetsEnabled: Bool = false
-    var desktopLineMode: Bool = false
-    var desktopPlacements: [String: ScreenPlacement] = [:]
-    var desktopLinePlacement: ScreenPlacement = ScreenPlacement(x: 0.5, y: 0.22)
     var widgetPlacements: [String: ScreenPlacement] = [:]
     var lockScreenAutoSize: Bool = true
     /// Live activities turned off: "charging", "devices", "volume", "unlock", "timer", "nowPlaying".

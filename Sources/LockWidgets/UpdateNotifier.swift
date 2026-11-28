@@ -15,7 +15,14 @@ final class UpdateNotifier: NSObject, UNUserNotificationCenterDelegate, @uncheck
     }
 
     func install() {
-        center?.delegate = self
+        guard let center else { return }
+        center.delegate = self
+        // Once that version (or a later one) is installed, its "is available" banner is stale.
+        if let notified = UserDefaults.standard.string(forKey: Self.notifiedKey),
+           let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           !Updater.isNewer(notified, than: current) {
+            center.removeDeliveredNotifications(withIdentifiers: ["notch.update.\(notified)"])
+        }
     }
 
     func notifyIfNeeded(version: String) {

@@ -5,7 +5,7 @@ Notch turns the top of your Mac's screen into a live "island" and puts widgets o
 - **Island:** album art and a waveform while music plays; volume and brightness levels; charging, low battery, AirPods/Bluetooth connections, timer, Focus and calendar alerts; other apps' notifications (optional). Hover or click to open a player with seek, like/shuffle/repeat and output-device switching, plus pages for widgets, a file shelf (with AirDrop) and a timer. When nothing is playing (or a song has been paused for a few seconds) the closed island shows the weather, "Not playing" or nothing (Settings › Island › Behaviour › More options).
 - **File shelf:** drop anything on the notch (files, folders, images, links, text; several at once) and drag it back out later. It holds the 10 newest items and keeps them across launches.
 - **Lock screen:** weather, air quality, Mac and AirPods/Bluetooth batteries, next event and forecast, and a working music player. You can place everything in a live preview of your own lock screen.
-- **Optional desktop widgets** and Spotify extras.
+- **Spotify extras**: like songs and switch speakers.
 
 On a MacBook with a notch the island fits the notch exactly. On Macs without one (older MacBooks, iMac, Mac mini, Mac Studio, or an external display as the main screen) it shows as a small pill at the top centre of the main screen.
 
@@ -51,7 +51,7 @@ Opening Notch again (from Finder or Spotlight) shows its Settings.
 ## First-time setup
 
 1. Open Notch. It grows out of your notch and says hello.
-2. **Choose your features**: island, lock-screen widgets, notifications, volume and brightness, calendar, desktop widgets, Spotify likes & devices. Everything can be changed later.
+2. **Choose your features**: island, lock-screen widgets, notifications, volume and brightness, calendar, Spotify likes & devices. Everything can be changed later.
 3. **Allow permissions**: only the ones your features need are listed, each with an Allow button (it shows the system prompt, or opens the right page in System Settings).
 4. **Connect Spotify** (only if you picked it): paste your own Client ID (see Integrations below).
 5. Point at the notch to open the island, right-click it for Settings, and lock your Mac to see your widgets.

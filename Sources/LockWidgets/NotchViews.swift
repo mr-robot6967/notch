@@ -17,6 +17,8 @@ struct NotchRootView: View {
         let size = controller.islandSize()
         let geometry = controller.geometry
         let content = NotchContent.current(model: model)
+        // Music/video that just ended keeps its wings on screen while they retract into the notch.
+        let ghost = controller.retractingContent(for: content)
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
                 NotchShape(bottomRadius: model.expanded ? 35 * controller.scale : 12 * controller.scale,
@@ -44,9 +46,13 @@ struct NotchRootView: View {
                 } else if case .transient(.notification(let note)) = content {
                     NotificationBanner(note: note, notchHeight: geometry.height)
                         .transition(.opacity.animation(.easeInOut(duration: 0.18)))
-                } else if content != .idle {
-                    CompactActivity(content: content, notchWidth: geometry.width, height: geometry.height)
-                        .id(contentKey(content))
+                } else if let shown = ghost ?? (content != .idle ? content : nil) {
+                    // Same view identity while retracting (no removal snap): the wings fade and
+                    // shrink toward the notch as the island eases back to the bare notch.
+                    CompactActivity(content: shown, notchWidth: geometry.width, height: geometry.height)
+                        .opacity(ghost == nil ? 1 : 0)
+                        .scaleEffect(ghost == nil ? 1 : 0.6)
+                        .id(contentKey(shown))
                         .transition(.asymmetric(
                             // Wait until a collapsing card has shrunk, so the two never overlap.
                             insertion: .modifier(active: SoftAppear(progress: 0, scale: 0.6), identity: SoftAppear(progress: 1, scale: 0.6))
@@ -86,6 +92,15 @@ struct NotchRootView: View {
                 return true
             }
             Spacer(minLength: 0)
+        }
+        // Playback ending (pause grace over, player quit, video ended) retracts slowly and softly,
+        // whatever transaction (or none) the change arrived in. Appearing keeps its own spring.
+        .transaction(value: ghost != nil) { t in
+            if ghost != nil { t.animation = IslandMotion.retract }
+        }
+        // Now Watching ending while music keeps playing narrows the island smoothly, not in a snap.
+        .transaction(value: content == .watching) { t in
+            if content == .nowPlaying, t.animation == nil { t.animation = IslandMotion.retract }
         }
         .frame(width: NotchController.panelSize.width, height: NotchController.panelSize.height, alignment: .top)
         .preferredColorScheme(.dark)
@@ -142,6 +157,7 @@ struct WaveformBars: View {
     var barWidth: CGFloat = 1.9
     var gap: CGFloat = 1.9
     @StateObject private var energy = WaveEnergy()
+    @StateObject private var live = LiveBars()
     @EnvironmentObject private var settings: AppSettings
     private var style: String { settings.config.waveformColor }
 
@@ -150,6 +166,11 @@ struct WaveformBars: View {
         TimelineView(.animation(minimumInterval: 1.0 / fps, paused: !playing && energy.level < 0.01)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             let level = energy.step(towards: playing ? 1 : 0, at: t)
+            // Real audio levels (read each frame, not observed) blended in when capture is live.
+            let audio = AudioLevels.shared
+            let mix = live.step(bands: audio.bands, count: count,
+                                live: settings.config.waveformReactsToAudio && audio.isLive, at: t)
+            let liveValues = live.values
             Canvas { context, size in
                 for i in 0..<count {
                     let fi = Double(i)
@@ -157,7 +178,10 @@ struct WaveformBars: View {
                     let wave = 0.55 * sin(t * (3.1 + fi * 0.73) + fi * 1.9)
                         + 0.30 * sin(t * (5.7 + fi * 0.41) + fi * 0.6)
                         + 0.15 * sin(t * 9.3 + fi * 2.4)
-                    let shaped = 0.5 + 0.5 * wave                  // 0...1
+                    let synthetic = 0.5 + 0.5 * wave               // 0...1
+                    let shaped = mix > 0.001 && i < liveValues.count
+                        ? (1 - mix) * synthetic + mix * liveValues[i]
+                        : synthetic
                     // Flattens to a row of dots when paused, rises smoothly when playing.
                     let h = max(barWidth, size.height * CGFloat((0.22 + 0.78 * shaped) * level))
                     let x = CGFloat(i) * (barWidth + gap)
@@ -177,6 +201,38 @@ struct WaveformBars: View {
             }
             .frame(width: width, height: maxHeight)
         }
+        .onAppear { AudioLevels.shared.waveformAppeared() }
+        .onDisappear { AudioLevels.shared.waveformDisappeared() }
+    }
+}
+
+/// Per-frame interpolation of the live audio bands for one waveform: resamples the published
+/// bands (low → high) to the bar count, glides towards them between 30 Hz updates, and cross-fades
+/// between the synthetic animation and the live one.
+final class LiveBars: ObservableObject {
+    private(set) var values: [Double] = []
+    private var mix: Double = 0
+    private var last: Double = 0
+
+    func step(bands: [Float], count: Int, live: Bool, at time: Double) -> Double {
+        let dt = last == 0 ? 0 : min(0.1, time - last)
+        last = time
+        if values.count != count { values = Array(repeating: 0, count: count) }
+        mix += ((live ? 1 : 0) - mix) * min(1, dt * 8)
+        if mix < 0.001 && !live { mix = 0; return 0 }
+        let k = min(1, dt * 30)                        // ~33 ms glide between updates
+        let n = bands.count
+        for i in 0..<count {
+            var target = 0.0
+            if n > 0 {
+                let p = count > 1 ? Double(i) * Double(n - 1) / Double(count - 1) : 0
+                let i0 = min(n - 1, Int(p)), i1 = min(n - 1, i0 + 1)
+                let f = p - Double(i0)
+                target = Double(bands[i0]) * (1 - f) + Double(bands[i1]) * f
+            }
+            values[i] += (target - values[i]) * k
+        }
+        return mix
     }
 }
 
@@ -633,8 +689,24 @@ private struct NowPlayingPage: View {
         let choice = settings.config.notchLeftControl
         if choice == "like" {
             let youtube = YTMusicBridge.browser(for: info.bundleIdentifier) != nil
-            let liked = (info.bundleIdentifier == "com.spotify.client" && spotify.isLiked) || (youtube && ytMusic.liked)
-            control(liked ? "heart.fill" : "heart", 16, dim: !liked, tint: liked ? (youtube ? .red : .green) : nil) {
+            let music = info.bundleIdentifier == "com.apple.Music"
+            let spotifyApp = info.bundleIdentifier == "com.spotify.client"
+            let liked = (spotifyApp && spotify.isLiked) || (youtube && ytMusic.liked)
+                || (music && media.musicFavorited)
+            // Each service's own control: Apple Music "Favourite" (star), Spotify "Liked Songs"
+            // (plus → green tick), YouTube Music "Like" (thumbs up); a heart elsewhere.
+            let symbol: String = music ? (liked ? "star.fill" : "star")
+                : spotifyApp ? (liked ? "checkmark.circle.fill" : "plus.circle")
+                : youtube ? (liked ? "hand.thumbsup.fill" : "hand.thumbsup")
+                : (liked ? "heart.fill" : "heart")
+            let tint: Color? = !liked ? nil
+                : music ? Color(red: 0.98, green: 0.24, blue: 0.33)       // Apple Music red
+                : spotifyApp ? Color(red: 0.11, green: 0.73, blue: 0.33)  // Spotify green
+                : youtube ? .white : .red
+            let likeLabel = music ? (liked ? "Unfavourite" : "Favourite")
+                : spotifyApp ? (liked ? "Remove from Liked Songs" : "Add to Liked Songs")
+                : youtube ? (liked ? "Remove like" : "Like") : "Like"
+            control(symbol, 16, dim: !liked, tint: tint) {
                 if info.canLike {
                     media.like()
                 } else {
@@ -642,7 +714,7 @@ private struct NowPlayingPage: View {
                     if youtube { YTMusicBridge.shared.refresh() } else { AppActions.shared.openSettingsPage("integrations") }
                 }
             }
-            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? "Like" : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Notifications & Apps to like songs"))
+            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? likeLabel : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Notifications & Apps to like songs"))
         } else if choice == "repeat" {
             control(info.repeatMode == 2 ? "repeat.1" : "repeat", 16, dim: !info.repeatOn, tint: info.repeatOn ? media.artworkColor : nil) { media.toggleRepeat() }
         } else if choice == "none" {

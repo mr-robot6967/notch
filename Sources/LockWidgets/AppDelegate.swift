@@ -14,7 +14,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var baker: WallpaperBaker?
     private(set) var lockOverlay: LockScreenOverlay?
     private(set) var notch: NotchController?
-    private(set) var desktopWidgets: DesktopWidgetsController?
     private var settingsWindow: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
@@ -66,7 +65,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         SpotifyClient.shared.start()
         Extras.shared.start()
         notch = NotchController(settings: settings, store: store)
-        desktopWidgets = DesktopWidgetsController(settings: settings, store: store)
         Updater.shared.start()
         settingsWindow = SettingsWindowController(settings: settings, store: store)
 

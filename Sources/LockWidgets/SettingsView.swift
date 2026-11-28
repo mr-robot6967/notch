@@ -6,7 +6,7 @@ import LockWidgetsCore
 
 /// System-Settings-style window: sidebar on the left, one tidy grouped form per page.
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, battery, connectivity, focus, display, sound, timing, nowPlaying, calendar, notch, desktop, lockScreen, widgets, placement, appearance, weather, batteries, integrations
+    case general, battery, connectivity, focus, display, sound, timing, nowPlaying, calendar, notch, lockScreen, widgets, placement, appearance, weather, batteries, integrations
     var id: String { rawValue }
 
     var title: String {
@@ -21,7 +21,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .nowPlaying: return "Now Playing"
         case .calendar: return "Calendar"
         case .notch: return "Island"
-        case .desktop: return "Desktop"
         case .lockScreen: return "Lock Screen"
         case .widgets: return "Widgets"
         case .placement: return "Placement"
@@ -44,7 +43,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .nowPlaying: return "play.fill"
         case .calendar: return "calendar"
         case .notch: return "capsule.tophalf.filled"
-        case .desktop: return "menubar.dock.rectangle"
         case .lockScreen: return "lock.fill"
         case .widgets: return "square.grid.2x2.fill"
         case .placement: return "rectangle.dashed"
@@ -67,7 +65,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .nowPlaying: return .red
         case .calendar: return .red
         case .notch: return .black
-        case .desktop: return .teal
         case .lockScreen: return .indigo
         case .widgets: return .blue
         case .placement: return .teal
@@ -90,7 +87,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .nowPlaying: return "Music from any app — controls, song changes and titles."
         case .calendar: return "Upcoming events and the calendar page."
         case .notch: return "How the island opens, its pages, gestures and size."
-        case .desktop: return "Optional widgets on your desktop, next to your apps."
         case .lockScreen: return "Widgets and the music player on the real lock screen."
         case .widgets: return "Choose and order the widgets shown on the lock screen."
         case .placement: return "Move the widgets and the player anywhere on the lock screen."
@@ -105,7 +101,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         ("", [.general]),
         ("Notifications", [.battery, .connectivity, .focus, .display, .sound]),
         ("Live Activities", [.nowPlaying, .calendar, .notch]),
-        ("Desktop", [.desktop]),
         ("Lock Screen", [.lockScreen, .widgets, .placement, .appearance]),
         ("Live Data", [.weather, .batteries]),
         ("Connected", [.integrations]),
@@ -141,8 +136,6 @@ struct SettingsSection: Identifiable {
               pages: [(.lockScreen, "Lock Screen"), (.placement, "Layout")]),
         .init(title: "Widgets", symbol: "square.grid.2x2.fill", color: .blue, subtitle: "Which widgets, their look and their data.",
               pages: [(.widgets, "Widgets"), (.appearance, "Theme"), (.weather, "Weather"), (.batteries, "Batteries")]),
-        .init(title: "Desktop", symbol: "menubar.dock.rectangle", color: .teal, subtitle: "Optional widgets on your desktop.",
-              pages: [(.desktop, "Desktop")]),
     ]
 
     static func containing(_ page: SettingsPage) -> SettingsSection {
@@ -194,7 +187,6 @@ struct SettingsView: View {
                 Group {
                 switch page {
                 case .general: GeneralTab()
-                case .desktop: DesktopPage()
                 case .battery: BatteryActivityPage()
                 case .connectivity: ConnectivityPage()
                 case .focus: FocusPage()
@@ -1545,6 +1537,15 @@ private struct NowPlayingSettingsPage: View {
                 Toggle("Show the app's icon on the album art", isOn: $settings.config.showSourceBadge)
             }
             Section {
+                Toggle("Waveform moves with the music", isOn: $settings.config.waveformReactsToAudio)
+                    .disabled(!AudioLevels.isSupported)
+                if !AudioLevels.isSupported {
+                    Text("Needs macOS 14.2 or later.").font(.caption).foregroundStyle(.secondary)
+                }
+            } footer: {
+                Text("Uses macOS's system-audio permission (macOS 14.2 or later). Audio is analysed on your Mac and never recorded or sent anywhere.")
+            }
+            Section {
                 Toggle("Show what I'm watching (Netflix, Prime, YouTube…)", isOn: $settings.config.watchingEnabled)
             } footer: {
                 Text("Shows the service for video in any browser or a streaming app. The exact show title needs Safari, Chrome, Brave or Edge with \"Allow JavaScript from Apple Events\" turned on, and isn't available in Firefox or DuckDuckGo. YouTube always shows the video title.")
@@ -1596,32 +1597,6 @@ private struct CalendarSettingsPage: View {
                         if on { settings.config.notchPages.append("calendar") }
                     }
                 ))
-            }
-        }
-        .formStyle(.grouped)
-    }
-}
-
-private struct DesktopPage: View {
-    @EnvironmentObject private var settings: AppSettings
-    var body: some View {
-        Form {
-            Section {
-                Toggle("Show widgets on the desktop", isOn: $settings.config.desktopWidgetsEnabled)
-                if settings.config.desktopWidgetsEnabled {
-                    Picker("Layout", selection: $settings.config.desktopLineMode) {
-                        Text("Free — move each widget").tag(false)
-                        Text("Line — move them together").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    HStack {
-                        Button("Arrange in a line") { AppDelegate.shared?.desktopWidgets?.arrangeInLine() }
-                            .disabled(settings.config.desktopLineMode)
-                        Button("Reset positions") { AppDelegate.shared?.desktopWidgets?.resetPositions() }
-                    }
-                }
-            } footer: {
-                Text("Drag widgets anywhere; they stay where you put them.")
             }
         }
         .formStyle(.grouped)

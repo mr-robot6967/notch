@@ -71,6 +71,8 @@ enum IslandMotion {
     static let activity = Animation.spring(response: 0.3, dampingFraction: 0.68)
     static let hover = Animation.spring(response: 0.34, dampingFraction: 0.72)
     static let page = Animation.spring(response: 0.4, dampingFraction: 0.86)
+    /// Now Playing / Now Watching retracting into the notch: slow, soft, no overshoot (~0.6 s).
+    static let retract = Animation.spring(response: 0.6, dampingFraction: 1.0)
 }
 
 @MainActor
@@ -670,7 +672,7 @@ final class NotchController {
         panel.isMovable = false
         panel.canBecomeVisibleWithoutLogin = true
         panel.animationBehavior = .none
-        panel.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 3)
+        panel.level = Self.islandLevel
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         // A window over the notch gets a "safe area" the height of the notch, and SwiftUI would push
         // the island down by that much. The island must start at the very top edge, so opt out.
@@ -833,20 +835,40 @@ final class NotchController {
         // changes neither the Space nor the frontmost app, so the observers above miss it and the
         // island would sit over the video. While media is playing (or while already hidden for
         // fullscreen, to catch the exit), re-check once a second. Honours "Hide in fullscreen apps".
+        // The timer only exists while it's needed, so an idle Mac isn't woken every second.
+        MediaController.shared.$info.map { $0?.isPlaying == true }.removeDuplicates()
+            .combineLatest(settings.$config.map { $0.notchEnabled && $0.notchHideInFullscreen }.removeDuplicates())
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateFullscreenPolling() }
+            .store(in: &cancellables)
+    }
+
+    /// Starts the 1 s fullscreen re-check while media plays or the island is hidden, stops it otherwise.
+    private func updateFullscreenPolling() {
+        let needed = settings.config.notchEnabled && settings.config.notchHideInFullscreen
+            && (MediaController.shared.info?.isPlaying == true || hiddenForFullscreen)
+        if !needed {
+            fullscreenPollTimer?.invalidate()
+            fullscreenPollTimer = nil
+            return
+        }
+        guard fullscreenPollTimer == nil else { return }
         let fsTimer = Timer(timeInterval: 1.0, repeats: true) { _ in
             MainActor.assumeIsolated {
-                guard let self = AppDelegate.shared?.notch, self.settings.config.notchEnabled,
-                      self.settings.config.notchHideInFullscreen else { return }
-                guard MediaController.shared.info?.isPlaying == true || self.hiddenForFullscreen else { return }
-                self.updateFullscreenHiding()
+                guard let self = AppDelegate.shared?.notch else { return }
+                self.updateFullscreenPolling()
+                if self.fullscreenPollTimer != nil { self.updateFullscreenHiding() }
             }
         }
         fsTimer.tolerance = 0.3
         RunLoop.main.add(fsTimer, forMode: .common)
-        self.fullscreenPollTimer = fsTimer
+        fullscreenPollTimer = fsTimer
     }
 
     private(set) var hiddenForFullscreen = false
+
+    /// Above everything, including the lock screen.
+    static let islandLevel = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 3)
     private var missionControlOpen = false
     private var missionControlTimer: Timer?
     private var fullscreenPollTimer: Timer?
@@ -937,6 +959,7 @@ final class NotchController {
         let hide = settings.config.notchEnabled && !model.locked && (fullscreen || missionControl)
         guard hide != hiddenForFullscreen || panel.alphaValue != (hide ? 0 : 1) else { return }
         hiddenForFullscreen = hide
+        updateFullscreenPolling() // while hidden, keep polling to catch the exit
         if hide {
             panel.ignoresMouseEvents = true
             if model.expanded { collapse() }
@@ -961,13 +984,47 @@ final class NotchController {
         // CG window bounds are top-left based on the primary display; convert the notch screen's frame.
         let primaryHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
         let screenTopLeftY = primaryHeight - screen.frame.maxY
+        var covers = false
         for w in list where (w[kCGWindowOwnerPID as String] as? Int32) == pid && (w[kCGWindowLayer as String] as? Int) == 0 {
             guard let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
             let x = b["X"] ?? .infinity, y = b["Y"] ?? .infinity
             if abs(x - screen.frame.minX) < 2, abs(y - screenTopLeftY) < 2,
-               (b["Width"] ?? 0) >= screen.frame.width, (b["Height"] ?? 0) >= screen.frame.height { return true }
+               (b["Width"] ?? 0) >= screen.frame.width, (b["Height"] ?? 0) >= screen.frame.height { covers = true; break }
         }
-        return false
+        guard covers else { return false }
+        // With the menu bar set to auto-hide, an ordinary maximised (zoomed / "Fill") window also
+        // covers the whole screen; that isn't fullscreen and must not hide the island. When the menu
+        // bar reserves no room, require the display to actually be on a fullscreen Space. (If the
+        // Space can't be read, keep the old behaviour.)
+        let menuBarReservesRoom = screen.visibleFrame.maxY < screen.frame.maxY - 1
+        if menuBarReservesRoom { return true }
+        return currentSpaceIsFullscreen(on: screen) ?? true
+    }
+
+    private typealias CopyManagedDisplaySpaces = @convention(c) (Int32) -> Unmanaged<CFArray>?
+    private typealias MainConnectionID = @convention(c) () -> Int32
+    private static let spaceAPI: (MainConnectionID, CopyManagedDisplaySpaces)? = {
+        guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight", RTLD_NOW),
+              let main = dlsym(handle, "SLSMainConnectionID"),
+              let copy = dlsym(handle, "SLSCopyManagedDisplaySpaces") else { return nil }
+        return (unsafeBitCast(main, to: MainConnectionID.self), unsafeBitCast(copy, to: CopyManagedDisplaySpaces.self))
+    }()
+
+    /// Whether `screen` is currently showing a fullscreen Space (type 4), or nil if unknown.
+    private static func currentSpaceIsFullscreen(on screen: NSScreen) -> Bool? {
+        guard let api = spaceAPI,
+              let displays = api.1(api.0())?.takeRetainedValue() as? [[String: Any]],
+              !displays.isEmpty else { return nil }
+        var entry: [String: Any]?
+        if displays.count == 1 {
+            entry = displays[0] // "Displays have separate Spaces" off: one entry ("Main") for all
+        } else if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue() {
+            let uuidString = CFUUIDCreateString(nil, uuid) as String
+            entry = displays.first { ($0["Display Identifier"] as? String)?.caseInsensitiveCompare(uuidString) == .orderedSame }
+        }
+        guard let current = entry?["Current Space"] as? [String: Any], let type = current["type"] as? Int else { return nil }
+        return type == 4
     }
 
     private func setVisible(_ visible: Bool) {
@@ -1143,6 +1200,31 @@ final class NotchController {
                       width: size.width + 2 * padding, height: size.height + padding + 6)
     }
 
+    // MARK: Retract
+
+    private var lastCompact: NotchContent = .idle
+    private var retractGhost: NotchContent?
+    private var retractUntil = Date.distantPast
+    private static let retractDuration: TimeInterval = 0.65
+
+    /// When the collapsed island goes from Now Playing / Now Watching to the bare notch, returns that
+    /// activity for `retractDuration` so the view can keep its wings while they retract (instead of
+    /// removing them at once and leaving empty black wings while the island shrinks). Called from
+    /// the view's body; only touches plain (unpublished) state.
+    func retractingContent(for content: NotchContent) -> NotchContent? {
+        defer { lastCompact = content }
+        guard !model.expanded, content == .idle else { retractGhost = nil; return nil }
+        if let ghost = retractGhost, Date() < retractUntil { return ghost }
+        retractGhost = nil
+        guard lastCompact == .nowPlaying || lastCompact == .watching else { return nil }
+        retractGhost = lastCompact
+        retractUntil = Date().addingTimeInterval(Self.retractDuration)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.retractDuration + 0.02) { [weak self] in
+            self?.model.objectWillChange.send() // re-render so the faded wings are removed
+        }
+        return lastCompact
+    }
+
     /// Tapping a replyable banner: open the island on Notifications with that message's reply field.
     /// Returns false when the island can't open (Compact only, locked…) so the caller opens the app.
     @discardableResult
@@ -1218,7 +1300,7 @@ final class NotchController {
         let handler: (NSEvent) -> Void = { event in
             MainActor.assumeIsolated { AppDelegate.shared?.notch?.handle(event) }
         }
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .scrollWheel]
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .leftMouseUp, .scrollWheel]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler) { monitors.append(global) }
         if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
             handler(event)
@@ -1306,6 +1388,16 @@ final class NotchController {
         let inside = islandRect(padding: model.expanded ? 18 : 6).contains(mouse)
         // Accept clicks/drops only over the island; everywhere else clicks pass through.
         panel.ignoresMouseEvents = !inside
+        // Drops can't reach the island's lock-screen-space window, so while dragging over it a
+        // normal window catches them (DropCatcher) and the island steps aside for the drag.
+        // It's put up as soon as any drag starts (drop targets must exist before the drag arrives),
+        // covering the island, so the drag never falls through to Mission Control's top edge.
+        if dragging && settings.config.notchPages.contains(NotchPage.shelf.rawValue) && !model.locked {
+            DropCatcher.shared.show(over: islandRect(padding: model.expanded ? 18 : 6))
+            panel.ignoresMouseEvents = true
+        } else if !dragging, DropCatcher.shared.isShowing {
+            DropCatcher.shared.hide()
+        }
         let inZone = hoverZone().contains(mouse)
         if inside != model.hovering || inZone != lastInZone {
             lastInZone = inZone

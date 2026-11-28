@@ -61,6 +61,7 @@ final class Updater: ObservableObject {
 
     func check() {
         guard state != .checking, state != .downloading, state != .installing else { return }
+        let previous = state
         state = .checking
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -71,7 +72,13 @@ final class Updater: ObservableObject {
             guard let (data, response) = result, (response as? HTTPURLResponse)?.statusCode == 200,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = json["tag_name"] as? String else {
-                self.state = .failed("Couldn't reach GitHub. Try again later.")
+                // A failed re-check (offline after wake) must not forget an update already found:
+                // that cleared the menu-bar badge and the Update Now button until the next good check.
+                if case .available = previous, self.dmgURL != nil {
+                    self.state = previous
+                } else {
+                    self.state = .failed("Couldn't reach GitHub. Try again later.")
+                }
                 return
             }
             // Only a check that got an answer counts for the 20 h auto-check gate: stamping failures
@@ -104,9 +111,11 @@ final class Updater: ObservableObject {
         return false
     }
 
-    /// A "SHA-256: <64 hex>" line in the release notes, if present.
+    /// A "SHA-256: <64 hex>" line in the release notes, if present. Anything may sit between the label
+    /// and the hash on the same line (e.g. "SHA-256 checksum:"), so a wording change can't silently
+    /// skip verification; the hash must be a whole 64-hex word.
     nonisolated static func sha256(in notes: String) -> String? {
-        guard let range = notes.range(of: #"(?i)sha-?256[^0-9a-f]*([0-9a-f]{64})"#, options: .regularExpression) else { return nil }
+        guard let range = notes.range(of: #"(?i)sha-?256[^\n]*?\b([0-9a-f]{64})\b"#, options: .regularExpression) else { return nil }
         let match = String(notes[range])
         return match.range(of: #"[0-9a-fA-F]{64}"#, options: .regularExpression).map { String(match[$0]).lowercased() }
     }
@@ -131,10 +140,6 @@ final class Updater: ObservableObject {
             state = .failed(blocker)
             return
         }
-        guard let requirement = Self.pinnedRequirement(of: Bundle.main.bundleURL.path) else {
-            state = .failed("This copy of Notch isn't signed with a certificate, so it can't verify updates. Download the new version from GitHub instead.")
-            return
-        }
         state = .downloading
         let expected = expectedSHA
         let bundleID = Bundle.main.bundleIdentifier ?? ""
@@ -142,6 +147,13 @@ final class Updater: ObservableObject {
         let tag = latestVersion ?? ""
         let current = currentVersion
         Task.detached(priority: .userInitiated) {
+            // Runs codesign and waits for it, so off the main thread (it froze the UI for a moment).
+            guard let requirement = Self.pinnedRequirement(of: installedPath) else {
+                await MainActor.run {
+                    Updater.shared.state = .failed("This copy of Notch isn't signed with a certificate, so it can't verify updates. Download the new version from GitHub instead.")
+                }
+                return
+            }
             do {
                 let (temp, response) = try await URLSession.shared.download(from: dmgURL)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.message("Download failed.") }

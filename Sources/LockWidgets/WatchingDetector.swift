@@ -52,6 +52,10 @@ final class WatchingDetector: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     private var pollScheduled = false
+    /// A layers 2/3 pass is queued or running; never queue another behind it (a slow browser would
+    /// otherwise pile up AppleScript calls on the shared queue that media controls also use).
+    private var refreshInFlight = false
+    private var lastNowPlayingTitle = ""
 
     static let generic = WatchingService(name: "Browser video", symbol: "play.tv.fill")
 
@@ -95,11 +99,26 @@ final class WatchingDetector: ObservableObject {
         return browserBundles.contains { bundle.hasPrefix($0 + ".app.") }
     }
 
-    private func isMusicSource(_ bundle: String?) -> Bool {
-        guard let bundle else { return false }
+    /// Marker returned by `detectService` for YouTube Music: a music source, never "watching".
+    nonisolated static let youTubeMusic = WatchingService(name: "YouTube Music", symbol: "music.note")
+    /// The browser source + Now Playing title whose window title named YouTube Music (layer 2), so
+    /// later evaluations of the same song stay music without waiting for another AX read.
+    private var musicWindow: (bundle: String, title: String)?
+
+    private func isMusicSource(_ info: NowPlayingInfo) -> Bool {
+        guard let bundle = info.bundleIdentifier else { return false }
         if Self.musicBundles.contains(bundle) { return true }
-        // YouTube Music in a browser: the music UI (and YTMusicBridge) owns it.
-        return YTMusicBridge.browser(for: bundle) != nil && YTMusicBridge.shared.active
+        // YouTube Music in a browser: the music UI (and YTMusicBridge) owns it. The bridge needs
+        // "Allow JavaScript from Apple Events", so also use signals that need no setup:
+        if YTMusicBridge.browser(for: bundle) != nil && YTMusicBridge.shared.active { return true }
+        guard Self.isBrowser(bundle) else { return false }
+        // - YouTube Music (and other music sites) fill the Now Playing album; YouTube videos and
+        //   streaming services leave it empty.
+        if !info.album.trimmingCharacters(in: .whitespaces).isEmpty { return true }
+        // - "YouTube Music" named in the Now Playing text, or in the window title for this song.
+        if Self.detectService(in: [info.appName, info.title].compactMap { $0 }.joined(separator: " ")) == Self.youTubeMusic { return true }
+        if let w = musicWindow, w.bundle == bundle, w.title == info.title { return true }
+        return false
     }
 
     /// First recognised service named anywhere in `text` (an app name, title, window title or URL),
@@ -107,6 +126,8 @@ final class WatchingDetector: ObservableObject {
     nonisolated static func detectService(in text: String) -> WatchingService? {
         let t = text.lowercased()
         guard !t.isEmpty else { return nil }
+        // Before "youtube": YouTube Music is music (handled by the Now Playing UI), not video.
+        if t.contains("youtube music") || t.contains("music.youtube") { return youTubeMusic }
         if t.contains("netflix") { return WatchingService(name: "Netflix", symbol: "play.tv.fill") }
         if t.contains("hotstar") { return WatchingService(name: "Hotstar", symbol: "play.tv.fill") }
         if t.contains("disney") { return WatchingService(name: "Disney+", symbol: "sparkles.tv.fill") }
@@ -199,7 +220,7 @@ final class WatchingDetector: ObservableObject {
         let media = MediaController.shared
         guard let info = media.info else { stopWatching(); return }
         let bundle = info.bundleIdentifier
-        guard !isMusicSource(bundle) else { stopWatching(); return }
+        guard !isMusicSource(info) else { stopWatching(); return }
 
         let combined = [info.appName, info.title].compactMap { $0 }.joined(separator: " ")
         let streaming = Self.streamingApps[bundle ?? ""]
@@ -207,24 +228,31 @@ final class WatchingDetector: ObservableObject {
         // catches browsers that report media through a generic process, e.g. DuckDuckGo via
         // "com.apple.WebKit.GPU"), or any known browser.
         guard let detected = streaming ?? Self.detectService(in: combined)
-                ?? (Self.isBrowser(bundle) ? Self.generic : nil) else { stopWatching(); return }
+                ?? (Self.isBrowser(bundle) ? Self.generic : nil),
+              detected != Self.youTubeMusic else { stopWatching(); return }
         // Keep the logo while it plays, OR while paused but the browser/streaming app is still in
         // front (you're browsing Netflix) — clear once you switch to another app. Music is never
         // handled here, so its "idle a few seconds after pause" behaviour is unchanged.
         let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontIsViewer = Self.isBrowser(frontBundle) || Self.streamingApps[frontBundle ?? ""] != nil
         guard info.isPlaying || frontIsViewer else { stopWatching(); return }
-        let serviceChanged = detected != service
         let wasWatching = isWatching
+        let np = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nowPlayingChanged = np != lastNowPlayingTitle
+        lastNowPlayingTitle = np
+        // A generic guess that layer 2 already upgraded (from the window title) keeps the upgrade
+        // for the same video; resetting it on every Now Playing update made the island flicker.
+        let effective = (wasWatching && !nowPlayingChanged && detected == Self.generic) ? service : detected
+        let serviceChanged = effective != service
 
-        service = detected
+        service = effective
         browserName = streaming != nil ? detected.name : Self.browserDisplayName(bundle)
 
         // Layer-1 title: the Now Playing title when it's distinct from the service (YouTube reports
-        // the video title here); otherwise the service name until layers 2/3 refine it.
-        if !wasWatching || serviceChanged {
-            let np = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            title = (!np.isEmpty && np.caseInsensitiveCompare(detected.name) != .orderedSame) ? np : detected.name
+        // the video title here); otherwise the service name until layers 2/3 refine it. Also reset
+        // when the Now Playing title changes (next video), or the old title stayed up.
+        if !wasWatching || serviceChanged || nowPlayingChanged {
+            title = (!np.isEmpty && np.caseInsensitiveCompare(effective.name) != .orderedSame) ? np : effective.name
         }
 
         isWatching = true
@@ -249,7 +277,10 @@ final class WatchingDetector: ObservableObject {
     private func scheduleNextPoll() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
-            guard self.isWatching else { self.pollScheduled = false; return }
+            // Paused (the logo stays while the browser is in front): no polling, so a paused tab
+            // doesn't run AX/AppleScript every 2 s all day. Now Playing changes and app switches
+            // still refresh, and resuming playback restarts the loop via evaluate().
+            guard self.isWatching, MediaController.shared.info?.isPlaying == true else { self.pollScheduled = false; return }
             self.refresh()
             self.scheduleNextPoll()
         }
@@ -258,9 +289,11 @@ final class WatchingDetector: ObservableObject {
     /// Reads the window title (layer 2) and, for supported browsers/services, the player DOM title
     /// (layer 3) off the main thread, then picks the best title.
     private func refresh() {
-        guard isWatching, let bundle = MediaController.shared.info?.bundleIdentifier else { return }
+        guard isWatching, !refreshInFlight, let bundle = MediaController.shared.info?.bundleIdentifier else { return }
+        refreshInFlight = true
         let scriptable = YTMusicBridge.browser(for: bundle)
         let currentService = service
+        let currentIsGeneric = service == Self.generic
         let pid = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first?.processIdentifier
         let axPermitted = AXIsProcessTrusted()
 
@@ -274,7 +307,7 @@ final class WatchingDetector: ObservableObject {
             // Layer 3: exact title from the player DOM (opt-in, scriptable browsers only).
             var exactTitle: String?
             var scriptError: String?
-            let serviceForBridge = windowService ?? currentService
+            let serviceForBridge = currentIsGeneric ? (windowService ?? currentService) : currentService
             if let scriptable, let bridge = Self.bridge(for: serviceForBridge) {
                 let (value, error) = Self.runBridge(bridge.js, host: bridge.host, in: scriptable)
                 scriptError = error
@@ -284,11 +317,26 @@ final class WatchingDetector: ObservableObject {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     let d = WatchingDetector.shared
+                    d.refreshInFlight = false
                     guard d.isWatching else { return }
+                    // The window is YouTube Music: it's music, so hand over to the Now Playing UI.
+                    if windowService == Self.youTubeMusic {
+                        if let info = MediaController.shared.info, info.bundleIdentifier == bundle {
+                            d.musicWindow = (bundle, info.title)
+                        }
+                        d.stopWatching()
+                        return
+                    }
                     d.noteError(scriptError, browser: scriptable)
-                    // A more specific service from the window title wins over a generic guess.
-                    if let windowService { d.service = windowService }
+                    // A more specific service from the window title wins over a generic guess (only
+                    // over a generic one: the focused tab may be a different site than the one playing).
+                    if let windowService, d.service == Self.generic { d.service = windowService }
                     let svc = d.service.name
+                    // The focused window is the playing video only when it names the same service
+                    // (or nothing better is known). Otherwise it's another tab (e.g. reading
+                    // Wikipedia while YouTube plays behind), and its title must not replace ours.
+                    let windowIsVideo = windowService.map { $0 == d.service }
+                        ?? (d.service == Self.generic && d.lastNowPlayingTitle.isEmpty)
 
                     func better(_ candidate: String?) -> String? {
                         guard let c = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty,
@@ -296,7 +344,7 @@ final class WatchingDetector: ObservableObject {
                         return c
                     }
                     // layer 3 > layer 2 > layer 1 (keep the existing layer-1 title otherwise).
-                    if let best = better(exactTitle) ?? better(strippedTitle) {
+                    if let best = better(exactTitle) ?? (windowIsVideo ? better(strippedTitle) : nil) {
                         d.title = best
                     } else if d.title.isEmpty {
                         d.title = svc

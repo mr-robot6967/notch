@@ -110,7 +110,7 @@ static void handle_command(NSString *line) {
     else if ([cmd isEqualToString:@"pause"]) sendCommand(1, nil);
     else if ([cmd isEqualToString:@"next"]) sendCommand(4, nil);
     else if ([cmd isEqualToString:@"previous"]) sendCommand(5, nil);
-    else if ([cmd isEqualToString:@"like"]) sendCommand(106, nil); // MRMediaRemoteCommandLikeTrack
+    else if ([cmd isEqualToString:@"like"]) sendCommand(21, nil); // kMRMediaRemoteCommandLikeTrack (106 is not a like command)
     else if ([cmd isEqualToString:@"shuffle"]) sendCommand(6, nil); // toggle shuffle
     else if ([cmd isEqualToString:@"repeat"]) sendCommand(7, nil);  // toggle repeat
     else if ([cmd isEqualToString:@"seek"] && parts.count > 1 && setElapsed) setElapsed(parts[1].doubleValue);

@@ -204,13 +204,15 @@ final class WhatsNewController: NSObject, NSWindowDelegate {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
     }
 
-    /// Called at launch. Fresh install: remember the version silently. Version changed: show once.
+    /// Called at launch. Fresh install (welcome still pending, so `suppress`): remember the version
+    /// silently. Version changed: show once. No stored version on a set-up copy means it was updated
+    /// from a release before What's New existed, which is an update too.
     func showIfUpdated(suppress: Bool = false) {
         guard let current = installedVersion else { return }
         let defaults = UserDefaults.standard
         let stored = defaults.string(forKey: Self.lastSeenKey)
         defaults.set(current, forKey: Self.lastSeenKey)
-        guard let stored, stored != current, !suppress else { return }
+        guard stored != current, !suppress else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.show() }
     }
 

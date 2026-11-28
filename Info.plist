@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.k2a.LockWidgets</string>
     <key>CFBundleVersion</key>
-    <string>1.6.0</string>
+    <string>1.6.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.6.0</string>
+    <string>1.6.1</string>
     <key>CFBundleExecutable</key>
     <string>Notch</string>
     <key>CFBundlePackageType</key>
@@ -36,6 +36,8 @@
     <string>Notch controls Music, Spotify or YouTube Music in your browser from the notch and shows album art.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Notch shows a notch alert with the battery level when AirPods or other Bluetooth devices connect.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Notch listens to what's playing to animate the waveform. Audio never leaves your Mac and isn't recorded.</string>
     <key>NSLocationUsageDescription</key>
     <string>Notch uses your location to show local weather.</string>
     <key>NSLocationWhenInUseUsageDescription</key>

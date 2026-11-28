@@ -745,14 +745,17 @@ struct MacBatteryWidget: View {
 
     var body: some View {
         if let b = store.mac {
-            let tint = batteryTint(level: b.level, charging: b.isCharging, settings: settings, theme: theme)
+            // Glyph and tint follow chargeState like the status text: plugged in and about to charge
+            // (charger negotiating, no hold reason) said "Charging" next to a plain battery glyph.
+            let charging = b.chargeState == .charging
+            let tint = batteryTint(level: b.level, charging: charging, settings: settings, theme: theme)
             // On hold shows the same plug glyph as the island's "On Hold" pop-up.
-            let symbol = b.chargeState == .onHold ? "powerplug.fill" : BatteryLook.symbol(for: b.level, charging: b.isCharging)
+            let symbol = b.chargeState == .onHold ? "powerplug.fill" : BatteryLook.symbol(for: b.level, charging: charging)
             if size == .compact {
                 RoundTile {
                     RingGauge(fraction: Double(b.level) / 100, tint: tint) {
                         Image(systemName: symbol)
-                            .font(.system(size: (b.isCharging ? 22 : 20) * k, weight: .semibold))
+                            .font(.system(size: (charging ? 22 : 20) * k, weight: .semibold))
                     }
                 } caption: {
                     Text(settings.config.showPercentText ? "\(b.level)%" : "Mac")
@@ -998,7 +1001,9 @@ struct CalendarWidget: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
-            let event = store.nextEvent
+            // The store refreshes every 2 min; an event that has just ended isn't "next" any more
+            // (it showed its old start time and a full ring until then).
+            let event = store.nextEvent.flatMap { $0.end > context.date ? $0 : nil }
             if size == .compact {
                 RoundTile {
                     RingGauge(fraction: eventFraction(event, now: context.date),
