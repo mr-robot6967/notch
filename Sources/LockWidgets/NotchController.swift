@@ -1330,11 +1330,6 @@ final class NotchController {
         return types.contains(.fileURL) || types.contains(.tiff) || types.contains(.png)
     }
 
-    /// The physical notch (a little wider, and past the top edge) — nothing underneath to block.
-    private func notchCatchRect() -> NSRect {
-        let g = geometry
-        return NSRect(x: g.centerX - g.width / 2 - 4, y: g.screenTop - g.height, width: g.width + 8, height: g.height + 6)
-    }
 
     /// While dragging: the notch plus ~220 pt each side and a little lower, so a drag that arrives
     /// near the notch (not dead on it) still opens the shelf.
@@ -1363,7 +1358,9 @@ final class NotchController {
             // Something is being dragged: you only need to get near the notch, not exactly on it.
             rect = dragApproachRect()
         } else {
-            rect = notchCatchRect()
+            // Not dragging: no window beside the notch at all.
+            if DropCatcher.shared.isShowing { DropCatcher.shared.hide() }
+            return
         }
         DropCatcher.shared.show(over: rect)
     }
