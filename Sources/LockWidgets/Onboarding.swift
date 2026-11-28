@@ -100,7 +100,7 @@ private struct OnboardingView: View {
     @StateObject private var state = OnboardingState()
     @EnvironmentObject private var settings: AppSettings
 
-    private let greetings = ["hello", "bonjour", "hola", "こんにちは", "नमस्ते", "hello"]
+    private let greetings = ["hello", "bonjour", "hola", "こんにちは", "नमस्ते", "నమస్కారం", "வணக்கம்", "নমস্কার", "नमस्कार", "ನಮಸ್ಕಾರ", "നമസ്കാരം", "નમસ્તે", "ਸਤ ਸ੍ਰੀ ਅਕਾਲ", "hello"]
 
     private var islandSize: CGSize {
         let panel = OnboardingController.panelSize
