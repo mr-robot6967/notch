@@ -350,6 +350,34 @@ func formatDuration(_ seconds: TimeInterval) -> String {
 
 // MARK: - Collapsed live activities
 
+/// A streaming service's mark for the collapsed island: Netflix's red "N", YouTube's red play
+/// button, otherwise the service's SF Symbol in white (a TV for an unknown site).
+private struct WatchingMark: View {
+    let service: WatchingService
+
+    static func tint(for service: WatchingService) -> Color? {
+        switch service.name {
+        case "Netflix": return Color(red: 0.898, green: 0.035, blue: 0.078) // #E50914
+        case "YouTube": return Color(red: 1.0, green: 0.0, blue: 0.0)       // #FF0000
+        default: return nil
+        }
+    }
+
+    var body: some View {
+        Group {
+            if service.name == "Netflix" {
+                Text("N").font(.system(size: 17, weight: .black)).foregroundStyle(Self.tint(for: service) ?? .white)
+            } else {
+                Image(systemName: service.symbol).font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Self.tint(for: service) ?? .white)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+        }
+        .frame(width: 20, height: 20)
+        .accessibilityLabel(service.name)
+    }
+}
+
 private struct CompactActivity: View {
     let content: NotchContent
     let notchWidth: CGFloat
@@ -376,16 +404,8 @@ private struct CompactActivity: View {
         case .nowPlaying:
             FlippingArtwork(size: 20, radius: 5)
         case .watching:
-            HStack(spacing: 6) {
-                Image(systemName: watching.service.symbol).font(.system(size: 13, weight: .semibold))
-                    .contentTransition(.symbolEffect(.replace))
-                // Show the service here only when the title (on the right) is the real show; a bare
-                // service name shows on the right instead, so it isn't duplicated.
-                if watching.hasDistinctTitle {
-                    Text(watching.service.name).font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.7)).lineLimit(1).fixedSize()
-                }
-            }
+            // Just the service's mark; the title shows when the island opens.
+            WatchingMark(service: watching.service)
         case .timer, .transient(.timerDone):
             Image(systemName: "timer").foregroundStyle(.orange)
         case .hud(let kind, _, let muted):
@@ -440,10 +460,8 @@ private struct CompactActivity: View {
         case .nowPlaying:
             WaveformBars(color: media.artworkColor, playing: media.info?.isPlaying == true, count: 5, maxHeight: 12, barWidth: 2.5, gap: 1)
         case .watching:
-            Text(watching.hasDistinctTitle ? watching.title : watching.service.name)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .lineLimit(1).truncationMode(.tail)
-                .frame(maxWidth: 150, alignment: .trailing)
+            WaveformBars(color: WatchingMark.tint(for: watching.service) ?? .white,
+                         playing: media.info?.isPlaying == true, count: 5, maxHeight: 12, barWidth: 2.5, gap: 1)
         case .timer:
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 Text(formatDuration(timer.remaining(at: ctx.date))).monospacedDigit().foregroundStyle(.orange).lineLimit(1).fixedSize()

@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Combine
 import Foundation
+import SwiftUI
 
 /// A streaming service we can show in the island: a display name and an SF Symbol.
 struct WatchingService: Equatable {
@@ -33,7 +34,8 @@ struct WatchingService: Equatable {
 final class WatchingDetector: ObservableObject {
     static let shared = WatchingDetector()
 
-    /// A video source (browser or streaming app) is the current Now Playing source.
+    /// The island shows the video: it has played for `settleDelay` and hasn't been paused for
+    /// longer than `pausedGrace` (see `evaluate`).
     @Published private(set) var isWatching = false
     /// The service being watched (name + SF Symbol); `generic` when it can't be identified.
     @Published private(set) var service: WatchingService = WatchingDetector.generic
@@ -192,10 +194,18 @@ final class WatchingDetector: ObservableObject {
 
     func start() {
         guard cancellables.isEmpty else { return }
-        // Re-evaluate whenever Now Playing changes (source, title) or the toggle flips.
+        // Re-evaluate whenever Now Playing changes (source, title, play/pause), synchronously and
+        // with the new value (an @Published sink runs in willSet, before `info` is updated): a
+        // deferred pass let the island render a frame of the music activity for a video that had
+        // just started, before it was recognised as video.
         MediaController.shared.$info
-            .receive(on: RunLoop.main)
-            .sink { _ in MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
+            .sink { info in
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { WatchingDetector.shared.evaluate(info) }
+                } else {
+                    DispatchQueue.main.async { MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
+                }
+            }
             .store(in: &cancellables)
         AppSettings.shared.$config
             .map(\.watchingEnabled)
@@ -212,25 +222,41 @@ final class WatchingDetector: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { _ in MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
             .store(in: &cancellables)
-        // Switching apps changes whether the browser is in front, which decides if a paused video
-        // keeps its logo — re-check on every app activation/deactivation.
-        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
-            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didDeactivateApplicationNotification))
-            .receive(on: RunLoop.main)
-            .sink { _ in MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
-            .store(in: &cancellables)
         evaluate()
     }
 
-    // MARK: Layer 1 (baseline)
+    // MARK: Layer 1 (baseline) and when to show
 
-    private func evaluate() {
-        guard AppSettings.shared.config.watchingEnabled else { stopWatching(); return }
-        let media = MediaController.shared
-        guard let info = media.info else { stopWatching(); return }
+    /// A video must play this long, uninterrupted and unchanged, before the island shows it, so
+    /// YouTube's home-page autoplay previews, Netflix's hover trailers and short clips never pop it.
+    static let settleDelay: TimeInterval = 4
+    /// After the shown video pauses or stops it stays up this long (same as music), so a quick
+    /// pause/resume doesn't flicker; then it retracts.
+    static let pausedGrace: TimeInterval = MediaController.pausedGrace
+
+    /// The current Now Playing source is a (non-music) video, shown yet or not. While a video is
+    /// settling the island keeps its idle content — never the music activity — for it.
+    @Published private(set) var isVideoSource = false
+
+    /// Fires once a playing video has settled (`settleDelay`); cancelled when it pauses or changes.
+    private var settleWork: DispatchWorkItem?
+    private var settlingKey: String?
+    /// Fires `pausedGrace` after the shown video paused; cancelled when it resumes.
+    private var graceWork: DispatchWorkItem?
+    /// The source (bundle) and video (bundle + Now Playing title) currently shown.
+    private var watchingBundle: String?
+    private var watchingKey: String?
+    /// The last video shown: resuming it later (after the grace) shows at once, without settling.
+    private var lastShownKey: String?
+
+    private static func key(_ info: NowPlayingInfo) -> String {
+        "\(info.bundleIdentifier ?? "")|\(info.title.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    /// The service for `info` when it's a video source (not music), plus the streaming app's entry.
+    private func classify(_ info: NowPlayingInfo) -> (detected: WatchingService, streaming: WatchingService?)? {
+        guard !isMusicSource(info) else { return nil }
         let bundle = info.bundleIdentifier
-        guard !isMusicSource(info) else { stopWatching(); return }
-
         let combined = [info.appName, info.title].compactMap { $0 }.joined(separator: " ")
         let streaming = Self.streamingApps[bundle ?? ""]
         // A video source: a known streaming app, a recognised service in the title/appName (this
@@ -238,13 +264,74 @@ final class WatchingDetector: ObservableObject {
         // "com.apple.WebKit.GPU"), or any known browser.
         guard let detected = streaming ?? Self.detectService(in: combined)
                 ?? (Self.isBrowser(bundle) ? Self.generic : nil),
-              detected != Self.youTubeMusic else { stopWatching(); return }
-        // Keep the logo while it plays, OR while paused but the browser/streaming app is still in
-        // front (you're browsing Netflix) — clear once you switch to another app. Music is never
-        // handled here, so its "idle a few seconds after pause" behaviour is unchanged.
-        let frontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontIsViewer = Self.isBrowser(frontBundle) || Self.streamingApps[frontBundle ?? ""] != nil
-        guard info.isPlaying || frontIsViewer else { stopWatching(); return }
+              detected != Self.youTubeMusic else { return nil }
+        return (detected, streaming)
+    }
+
+    /// Shows a video only while it actually plays:
+    ///  - it appears once the same video has played uninterrupted for `settleDelay` (4 s); a video
+    ///    that was already shown appears again at once when resumed;
+    ///  - the same source playing straight on (next video, next episode) keeps it up;
+    ///  - pausing/stopping hides it after `pausedGrace` (3 s); resuming within that keeps it up;
+    ///  - music, no media, or the setting turned off hide it at once.
+    /// Event driven (Now Playing changes + one-shot work items): nothing runs while idle.
+    private func evaluate(_ newInfo: NowPlayingInfo?? = nil) {
+        let current: NowPlayingInfo? = newInfo ?? MediaController.shared.info
+        guard AppSettings.shared.config.watchingEnabled, let info = current, let kind = classify(info) else {
+            stopWatching(); return
+        }
+        if !isVideoSource { isVideoSource = true }
+        let key = Self.key(info)
+
+        guard info.isPlaying else {
+            // Paused/stopped: a settling video starts over next time; a shown one gets the grace.
+            cancelSettle()
+            if isWatching { startGrace() }
+            return
+        }
+
+        if isWatching {
+            let paused = graceWork != nil
+            cancelGrace()
+            // The same video resumed within the grace, or the same source playing straight on:
+            // stays up. A different video after a pause, or another source: settle again.
+            if paused ? key == watchingKey : info.bundleIdentifier == watchingBundle {
+                present(info, kind)
+                return
+            }
+            hideNow()
+        }
+        if key == lastShownKey {
+            // Resuming a video that was already shown (paused longer than the grace).
+            cancelSettle()
+            withAnimation(IslandMotion.activity) { present(info, kind) }
+            return
+        }
+        guard settlingKey != key || settleWork == nil else { return } // already settling this one
+        cancelSettle()
+        settlingKey = key
+        let work = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let d = WatchingDetector.shared
+                d.settleWork = nil
+                guard AppSettings.shared.config.watchingEnabled, let now = MediaController.shared.info,
+                      now.isPlaying, Self.key(now) == d.settlingKey, let kind = d.classify(now) else {
+                    d.settlingKey = nil
+                    return
+                }
+                d.settlingKey = nil
+                withAnimation(IslandMotion.activity) { d.present(now, kind) }
+            }
+        }
+        settleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleDelay, execute: work)
+    }
+
+    /// Shows (or updates) the island for `info`, and runs the title layers.
+    private func present(_ info: NowPlayingInfo, _ kind: (detected: WatchingService, streaming: WatchingService?)) {
+        let detected = kind.detected
+        let streaming = kind.streaming
+        let bundle = info.bundleIdentifier
         let wasWatching = isWatching
         let np = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let nowPlayingChanged = np != lastNowPlayingTitle
@@ -254,8 +341,9 @@ final class WatchingDetector: ObservableObject {
         let effective = (wasWatching && !nowPlayingChanged && detected == Self.generic) ? service : detected
         let serviceChanged = effective != service
 
-        service = effective
-        browserName = streaming != nil ? detected.name : Self.browserDisplayName(bundle)
+        if serviceChanged { service = effective }
+        let browser = streaming != nil ? detected.name : Self.browserDisplayName(bundle)
+        if browser != browserName { browserName = browser }
 
         // Layer-1 title: the Now Playing title when it's distinct from the service (YouTube reports
         // the video title here); otherwise the service name until layers 2/3 refine it. Also reset
@@ -264,15 +352,58 @@ final class WatchingDetector: ObservableObject {
             title = (!np.isEmpty && np.caseInsensitiveCompare(effective.name) != .orderedSame) ? np : effective.name
         }
 
-        isWatching = true
-        if !wasWatching { needsAppleEvents = nil }
-        refresh()        // immediate layers 2/3 pass
-        startPolling()   // then at most every ~2 s while watching
+        watchingBundle = bundle
+        watchingKey = Self.key(info)
+        lastShownKey = watchingKey
+        if !wasWatching {
+            needsAppleEvents = nil
+            isWatching = true
+        }
+        refresh(bundle: bundle) // immediate layers 2/3 pass
+        startPolling()          // then at most every ~2 s while it plays
     }
 
-    private func stopWatching() {
+    private func startGrace() {
+        guard graceWork == nil else { return } // already counting this pause
+        let work = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                let d = WatchingDetector.shared
+                d.graceWork = nil
+                // The island has normally retracted already (MediaController's own pause grace
+                // ends first); NotchRootView's retract transaction animates it either way.
+                withAnimation(IslandMotion.retract) { d.hideNow() }
+            }
+        }
+        graceWork = work
+        // A hair after MediaController's grace, so a paused video never shows as music meanwhile.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pausedGrace + 0.1, execute: work)
+    }
+
+    private func cancelSettle() {
+        settleWork?.cancel()
+        settleWork = nil
+        settlingKey = nil
+    }
+
+    private func cancelGrace() {
+        graceWork?.cancel()
+        graceWork = nil
+    }
+
+    /// Hides the island at once (the video may still be the Now Playing source, e.g. paused).
+    private func hideNow() {
+        cancelGrace()
+        watchingBundle = nil
+        watchingKey = nil
         if isWatching { isWatching = false }
         // The poll loop notices isWatching == false and stops itself (no CPU while idle).
+    }
+
+    /// No video source any more (music, nothing playing, or the setting is off).
+    private func stopWatching() {
+        cancelSettle()
+        hideNow()
+        if isVideoSource { isVideoSource = false }
     }
 
     // MARK: Layers 2 & 3 (window title / exact-title bridge), polled while watching
@@ -286,9 +417,7 @@ final class WatchingDetector: ObservableObject {
     private func scheduleNextPoll() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
-            // Paused (the logo stays while the browser is in front): no polling, so a paused tab
-            // doesn't run AX/AppleScript every 2 s all day. Now Playing changes and app switches
-            // still refresh, and resuming playback restarts the loop via evaluate().
+            // Paused (within the grace): no polling. Resuming restarts the loop via evaluate().
             guard self.isWatching, MediaController.shared.info?.isPlaying == true else { self.pollScheduled = false; return }
             self.refresh()
             self.scheduleNextPoll()
@@ -297,8 +426,9 @@ final class WatchingDetector: ObservableObject {
 
     /// Reads the window title (layer 2) and, for supported browsers/services, the player DOM title
     /// (layer 3) off the main thread, then picks the best title.
-    private func refresh() {
-        guard isWatching, !refreshInFlight, let bundle = MediaController.shared.info?.bundleIdentifier else { return }
+    private func refresh(bundle source: String? = nil) {
+        guard isWatching, !refreshInFlight,
+              let bundle = source ?? MediaController.shared.info?.bundleIdentifier else { return }
         refreshInFlight = true
         let scriptable = YTMusicBridge.browser(for: bundle)
         let currentService = service

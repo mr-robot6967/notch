@@ -1165,7 +1165,8 @@ final class NotchController {
         switch content {
         case .idle: return CGSize(width: g.width + 6 * k * grow, height: g.height + 2 * k * grow)
         case .nowPlaying: return CGSize(width: g.width + 2 * 37 * t + 4 * k * grow, height: g.height + 1.5 * k * grow)
-        case .watching: return CGSize(width: g.width + 2 * 100 * t, height: g.height + 1.5 * k * grow)
+        // Just the service mark and a playing indicator: the same footprint as the music activity.
+        case .watching: return CGSize(width: g.width + 2 * 37 * t + 4 * k * grow, height: g.height + 1.5 * k * grow)
         case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * t, height: g.height)
         case .device: return CGSize(width: g.width + 2 * 96 * t, height: g.height)
         case .transient(.event): return CGSize(width: g.width + 2 * 110 * t, height: g.height)
@@ -1576,7 +1577,8 @@ enum NotchContent: Equatable {
     case device
     case timer
     case nowPlaying
-    /// Watching a video in a browser or streaming app (Netflix, YouTube…): show title + service.
+    /// Watching a video in a browser or streaming app (Netflix, YouTube…): the service mark and a
+    /// playing indicator (the title shows in the open island).
     case watching
     case idleWeather
     /// Idle: a dimmed note and "Not playing".
@@ -1601,9 +1603,14 @@ enum NotchContent: Equatable {
         if let info = media.info, media.songIsRecent,
            !(cfg.notchHideWhenSourceActive && info.bundleIdentifier == NSWorkspace.shared.frontmostApplication?.bundleIdentifier) {
             // Watching video in a browser/streaming app has its own toggle; music is left to the
-            // Now Playing activity (which keeps its own on/off switch).
-            if cfg.watchingEnabled, WatchingDetector.shared.isWatching { return .watching }
-            if !cfg.disabledActivities.contains("nowPlaying") { return .nowPlaying }
+            // Now Playing activity (which keeps its own on/off switch). A video that is still
+            // settling (a preview/trailer may be all it is) shows nothing yet, not the music activity.
+            let watching = WatchingDetector.shared
+            if cfg.watchingEnabled, watching.isVideoSource || watching.isWatching {
+                if watching.isWatching { return .watching }
+            } else if !cfg.disabledActivities.contains("nowPlaying") {
+                return .nowPlaying
+            }
         }
         switch cfg.idleActivity {
         case "weather" where WidgetStore.shared.weather != nil: return .idleWeather
