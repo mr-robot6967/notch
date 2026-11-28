@@ -468,6 +468,12 @@ final class SpotifyClient: ObservableObject {
         return (code, data)
     }
 
+    /// "title|artist" of the playing Spotify song; nil when Spotify isn't the source (momentary gaps).
+    private static func playingKey() -> String? {
+        guard let info = MediaController.shared.info, info.bundleIdentifier == "com.spotify.client" else { return nil }
+        return "\(info.title)|\(info.artist)"
+    }
+
     /// Song key ("title|artist") the current heart belongs to.
     private(set) var likedKey = ""
 
@@ -479,6 +485,11 @@ final class SpotifyClient: ObservableObject {
         // Right after a skip Spotify can still report the previous song; retry briefly until it
         // matches what's on screen, so the heart is never taken from the wrong track.
         let expected = MediaController.shared.info?.title.lowercased() ?? ""
+        // The song this check is for. If another starts while we wait on Spotify, this answer must
+        // not land on it: it would show the old song's heart under the new key (likedKey), and a ♥
+        // in that window saved or removed the previous track.
+        let checkingKey = Self.playingKey()
+        func stillSameSong() -> Bool { Self.playingKey().map { $0 == checkingKey } ?? true }
         var item: [String: Any]?
         for attempt in 0..<3 {
             let (code, data) = await api("GET", "/me/player/currently-playing?market=from_token")
@@ -491,7 +502,7 @@ final class SpotifyClient: ObservableObject {
             }
             if attempt < 2 { try? await Task.sleep(nanoseconds: 1_200_000_000) }
         }
-        guard let item, let id = item["id"] as? String else { return false }
+        guard let item, let id = item["id"] as? String, stillSameSong() else { return false }
         var ids = [id]
         if let linked = (item["linked_from"] as? [String: Any])?["id"] as? String, linked != id { ids.append(linked) }
         currentTrackID = id
@@ -510,7 +521,9 @@ final class SpotifyClient: ObservableObject {
         let matchReleases = AppSettings.shared.config.spotifyMatchReleases
         if matchReleases { await refreshLikedIndex() }
         let other = matchReleases ? (isrc.flatMap { likedByISRC[$0] } ?? likedByKey[key]) : nil
-        if let exact = await libraryContains(ids) {
+        let exactResult = await libraryContains(ids)
+        guard stillSameSong(), currentTrackID == id else { return false }
+        if let exact = exactResult {
             matchedSavedID = exact ? nil : other
             isLiked = exact || other != nil
         } else if let other {

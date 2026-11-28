@@ -331,12 +331,14 @@ final class WidgetStore: ObservableObject {
                     let store = WidgetStore.shared
                     store.peripheralsInFlight = false
                     if fullScan { store.lastBluetooth = bluetooth }
-                    if store.fullScanQueued {
-                        store.fullScanQueued = false
-                        if !fullScan { store.refreshPeripherals(fullScan: true) }
-                    }
                     guard !store.usingDemoDevices else { return }
                     if merged != store.peripherals { store.peripherals = merged }
+                    // A full scan asked for while this one ran (AirPods connecting mid-scan) still runs:
+                    // a full scan that started before the device connected doesn't list it either.
+                    if store.fullScanQueued {
+                        store.fullScanQueued = false
+                        store.refreshPeripherals(fullScan: true)
+                    }
                 }
             }
         }

@@ -126,16 +126,21 @@ public enum OpenMeteo {
 
     public static func decodeForecast(_ data: Data, locationName: String, unit: TemperatureUnit, now: Date = Date()) throws -> WeatherSnapshot {
         let r = try JSONDecoder().decode(ForecastResponse.self, from: data)
+        // "yyyy-MM-dd" is a calendar day, and the only use of the date is its weekday label, which is
+        // formatted in the Mac's time zone. Parsing it as midnight in the *location's* zone (a city
+        // set in Settings far east of the Mac) landed on the previous day here, so every forecast
+        // column showed yesterday's weekday. Noon in the Mac's own zone keeps the day (and avoids
+        // DST gaps at midnight).
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = r.timezone.flatMap(TimeZone.init(identifier:)) ?? .current
+        fmt.dateFormat = "yyyy-MM-dd HH:mm"
+        fmt.timeZone = .current
 
         let count = min(r.daily.time.count, r.daily.weather_code.count, r.daily.temperature_2m_max.count, r.daily.temperature_2m_min.count)
         var days: [DailyForecast] = []
         for i in 0..<count {
             // Days with a missing value are skipped rather than failing the forecast.
-            guard let date = fmt.date(from: r.daily.time[i]), let high = r.daily.temperature_2m_max[i],
+            guard let date = fmt.date(from: r.daily.time[i] + " 12:00"), let high = r.daily.temperature_2m_max[i],
                   let low = r.daily.temperature_2m_min[i], let code = r.daily.weather_code[i] else { continue }
             days.append(DailyForecast(date: date, high: high, low: low, code: code))
         }

@@ -161,3 +161,27 @@ import Testing
     #expect(devices.filter { $0.name == "My AirPods" }.count == 3)
     #expect(!devices.contains { $0.name == "My AirPods" && $0.component == nil })
 }
+
+@Test func forecastDaysKeepTheirCalendarDayForFarAwayCities() throws {
+    // A city set in Settings 14 hours ahead of the Mac: its "2026-11-28" must still be the 28th
+    // (and so the right weekday) when shown in the Mac's own time zone.
+    let json = """
+    {"timezone":"Pacific/Kiritimati",
+     "current":{"temperature_2m":28.0,"weather_code":1,"is_day":1},
+     "daily":{"time":["2026-11-28","2026-11-29"],"weather_code":[1,2],"temperature_2m_max":[30.0,29.5],"temperature_2m_min":[25.0,24.8]}}
+    """
+    let w = try OpenMeteo.decodeForecast(Data(json.utf8), locationName: "Kiritimati", unit: .celsius)
+    let parts = Calendar.current.dateComponents([.year, .month, .day], from: w.daily[0].date)
+    #expect(parts.year == 2026 && parts.month == 11 && parts.day == 28)
+    #expect(Calendar.current.component(.day, from: w.daily[1].date) == 29)
+}
+
+@Test func forecastSkipsDaysWithMissingValues() throws {
+    let json = """
+    {"current":{"temperature_2m":10.0},
+     "daily":{"time":["2026-11-28","2026-11-29"],"weather_code":[null,3],"temperature_2m_max":[12.0,11.0],"temperature_2m_min":[6.0,5.0]}}
+    """
+    let w = try OpenMeteo.decodeForecast(Data(json.utf8), locationName: "X", unit: .celsius)
+    #expect(w.daily.count == 1)
+    #expect(w.high == 11.0 && w.code == 3)
+}

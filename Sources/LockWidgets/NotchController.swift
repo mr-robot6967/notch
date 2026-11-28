@@ -1038,6 +1038,7 @@ final class NotchController {
             // Don't come back already open (and stuck that way) when the island is turned on again.
             if model.expanded { collapse() }
             panel.orderOut(nil)
+            syncDropCatcher() // never leave the catcher up once the island is off
         }
     }
 
@@ -1317,17 +1318,30 @@ final class NotchController {
             if event.type == .leftMouseDown {
                 // Dragging a shelf item out starts on the island; any other drag is incoming.
                 dragFromIsland = islandRect(padding: model.expanded ? 18 : 6).contains(NSEvent.mouseLocation)
+                dragPasteboardCountAtMouseDown = NSPasteboard(name: .drag).changeCount
             }
             mouseMoved()
         }
     }
 
     private var dragFromIsland = false
+    /// The drag pasteboard's change count when the button went down. The drag pasteboard keeps the
+    /// LAST drag's types forever, so without this a window or text-selection drag near the top
+    /// (after any earlier file drag) read as a file drag and popped the shelf open.
+    private var dragPasteboardCountAtMouseDown = -1
 
-    /// The current drag carries files or images (not just a link, text or a browser tab).
-    private static func dragCarriesFiles() -> Bool {
-        let types = NSPasteboard(name: .drag).types ?? []
+    /// The current drag carries files or images (not just a link, text or a browser tab), and was
+    /// started during this press.
+    private func dragCarriesFiles() -> Bool {
+        let pb = NSPasteboard(name: .drag)
+        guard pb.changeCount != dragPasteboardCountAtMouseDown else { return false }
+        let types = pb.types ?? []
         return types.contains(.fileURL) || types.contains(.tiff) || types.contains(.png)
+    }
+
+    /// Where a file drag opens the shelf ahead of the menu-bar strip (see mouseMoved).
+    private func inDragOpenZone(_ mouse: NSPoint) -> Bool {
+        mouse.y > geometry.screenTop - 260 && abs(mouse.x - geometry.centerX) < geometry.width / 2 + 340
     }
 
 
@@ -1453,8 +1467,8 @@ final class NotchController {
         if dragging && !dragFromIsland && !DropCatcher.shared.dragActive && !model.locked
             && settings.config.notchExpandMode != .never
             && settings.config.notchPages.contains(NotchPage.shelf.rawValue)
-            && mouse.y > geometry.screenTop - 260 && abs(mouse.x - geometry.centerX) < geometry.width / 2 + 340
-            && Self.dragCarriesFiles() {
+            && inDragOpenZone(mouse)
+            && dragCarriesFiles() {
             DropCatcher.shared.dragActive = true
             dropDragEntered()
         }
@@ -1497,11 +1511,16 @@ final class NotchController {
         } else if !inside {
             hoverWork?.cancel()
             hoverWork = nil
-            if model.expanded && collapseWork == nil {
+            // A file drag that opened the shelf ahead of the notch is still on its way to it: don't
+            // close the island under it (it used to collapse 0.35 s later, back to the top edge).
+            let dragHeld = dragging && DropCatcher.shared.dragActive && inDragOpenZone(mouse)
+            if model.expanded && collapseWork == nil && !dragHeld {
                 let work = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.collapseWork = nil
-                    if !self.islandRect(padding: 18).contains(NSEvent.mouseLocation) { self.collapse() }
+                    let now = NSEvent.mouseLocation
+                    if NSEvent.pressedMouseButtons & 1 != 0 && DropCatcher.shared.dragActive && self.inDragOpenZone(now) { return }
+                    if !self.islandRect(padding: 18).contains(now) { self.collapse() }
                 }
                 collapseWork = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)

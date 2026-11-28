@@ -203,6 +203,15 @@ final class WatchingDetector: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { _ in MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
             .store(in: &cancellables)
+        // isMusicSource reads the YouTube Music bridge, which answers ~1 s after a song change: a
+        // YouTube video that followed YouTube Music in the same browser was judged with the stale
+        // "active" and never re-checked (no further Now Playing update while it played).
+        YTMusicBridge.shared.$active
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { _ in MainActor.assumeIsolated { WatchingDetector.shared.evaluate() } }
+            .store(in: &cancellables)
         // Switching apps changes whether the browser is in front, which decides if a paused video
         // keeps its logo — re-check on every app activation/deactivation.
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
@@ -358,6 +367,9 @@ final class WatchingDetector: ObservableObject {
     /// Defensive: nil whenever an attribute is missing or the wrong type.
     private nonisolated static func axWindowTitle(pid: pid_t) -> String? {
         let app = AXUIElementCreateApplication(pid)
+        // A hung browser would otherwise hold the shared AppleScript queue (media controls) for the
+        // default ~6 s AX timeout on every poll.
+        AXUIElementSetMessagingTimeout(app, 1.0)
         func string(_ element: AXUIElement, _ attribute: String) -> String? {
             var ref: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success else { return nil }

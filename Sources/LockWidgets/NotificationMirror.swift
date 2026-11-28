@@ -93,6 +93,12 @@ final class NotificationMirror: ObservableObject {
                 // no file at that moment the watcher was gone for good and banners came only from this
                 // 15 s timer. Re-attach whenever the watched file is no longer the current one.
                 if mirror.running, mirror.hasAccess, mirror.lastID >= 0, !mirror.watchIsCurrent() { mirror.watch() }
+                // Each read copies the whole database to a temp folder; doing that every 15 s while
+                // nothing changed was pure disk churn. Read when the files changed since the last tick
+                // (or the last read failed, so a missed row is retried).
+                let signature = mirror.databaseSignature()
+                guard signature != mirror.lastTickSignature || mirror.lastReadFailed else { return }
+                mirror.lastTickSignature = signature
                 mirror.scheduleRead()
             }
         }
@@ -114,6 +120,18 @@ final class NotificationMirror: ObservableObject {
 
     private var wakeObserver: NSObjectProtocol?
     private var watchedInode: ino_t = 0
+    private var lastTickSignature: String?
+    private var lastReadFailed = false
+    private var primeRetryDelay: TimeInterval = 5
+
+    /// Size, modification time and inode of the database and its WAL: changes whenever a row lands.
+    private func databaseSignature() -> String {
+        ["db", "db-wal"].map { name -> String in
+            var info = stat()
+            guard stat(dbDir.appendingPathComponent(name).path, &info) == 0 else { return "-" }
+            return "\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec)"
+        }.joined(separator: "|")
+    }
 
     private func watchIsCurrent() -> Bool {
         guard watcher != nil else { return false }
@@ -135,7 +153,11 @@ final class NotificationMirror: ObservableObject {
                     case .failure(.failed):
                         // A copy that raced a checkpoint (or the database busy at login) is not "no
                         // Full Disk Access"; that used to switch mirroring off until Settings rechecked.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { NotificationMirror.shared.primePosition() }
+                        // Back off (5 s doubling to 5 min): a failure that persists (a database layout
+                        // this macOS changed) must not copy the whole database every 5 s forever.
+                        let delay = mirror.primeRetryDelay
+                        mirror.primeRetryDelay = min(300, delay * 2)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { NotificationMirror.shared.primePosition() }
                     case .failure:
                         mirror.hasAccess = false
                         // Nothing to read without Full Disk Access: stop the 15 s safety-net timer
@@ -144,6 +166,7 @@ final class NotificationMirror: ObservableObject {
                         mirror.fallbackTimer = nil
                         notifLog.notice("No access to the notification database (Full Disk Access needed)")
                     case .success(let result):
+                        mirror.primeRetryDelay = 5
                         mirror.hasAccess = true
                         mirror.lastID = result.maxID
                         mirror.watch()
@@ -202,10 +225,14 @@ final class NotificationMirror: ObservableObject {
     private func readNew() {
         let after = lastID
         readQueue.async { [dbDir] in
-            guard case .success(let result) = Self.readRecords(in: dbDir, after: after) else { return }
+            guard case .success(let result) = Self.readRecords(in: dbDir, after: after) else {
+                DispatchQueue.main.async { MainActor.assumeIsolated { NotificationMirror.shared.lastReadFailed = true } }
+                return
+            }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     let mirror = NotificationMirror.shared
+                    mirror.lastReadFailed = false
                     // Notification Center rebuilt its database (ids start again lower): nothing would
                     // ever be "after" our old position again, so resync to the new newest id. (A big
                     // drop only: a copy that missed the WAL can lag slightly behind and is no reset.)

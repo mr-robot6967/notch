@@ -459,6 +459,9 @@ final class MediaKeyTap {
     func stop() {
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        // Without invalidating, every off/on of "Replace the system pop-up" left the old (disabled)
+        // event tap registered with the window server.
+        if let tap { CFMachPortInvalidate(tap) }
         tap = nil
         source = nil
     }

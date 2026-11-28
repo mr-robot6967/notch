@@ -296,6 +296,9 @@ private struct OnboardingView: View {
         }
         .onAppear {
             state.refresh()
+            // onAppear can run again without an onDisappear in between (step transitions); never
+            // leave an older 1 s timer running behind the new one.
+            state.timer?.invalidate()
             state.timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
                 MainActor.assumeIsolated { state.refresh() }
             }

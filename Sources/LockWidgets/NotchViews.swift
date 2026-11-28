@@ -163,7 +163,7 @@ struct WaveformBars: View {
 
     var body: some View {
         let width = CGFloat(count) * barWidth + CGFloat(count - 1) * gap
-        TimelineView(.animation(minimumInterval: 1.0 / fps, paused: !playing && energy.level < 0.01)) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / fps, paused: !playing && energy.resting)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             let level = energy.step(towards: playing ? 1 : 0, at: t)
             // Real audio levels (read each frame, not observed) blended in when capture is live.
@@ -239,12 +239,24 @@ final class LiveBars: ObservableObject {
 /// Eases the waveform's energy in and out (critically damped), so play/pause transitions glide.
 final class WaveEnergy: ObservableObject {
     private(set) var level: Double = 0
+    /// Bars have settled flat while paused. Published (unlike `level`) so the view re-renders and
+    /// pauses its TimelineView: `paused:` is only read when the body runs, so after a pause the
+    /// timeline kept redrawing flat bars at 30–60 fps until something else updated the view.
+    @Published private(set) var resting = true
     private var last: Double = 0
 
     func step(towards target: Double, at time: Double) -> Double {
         let dt = last == 0 ? 0 : min(0.1, time - last)
         last = time
         level += (target - level) * min(1, dt * 6)
+        let rest = target == 0 && level < 0.01
+        if rest != resting {
+            // Not during the view update that called us.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.resting != rest else { return }
+                self.resting = rest
+            }
+        }
         return level
     }
 }
@@ -691,7 +703,8 @@ private struct NowPlayingPage: View {
             let youtube = YTMusicBridge.browser(for: info.bundleIdentifier) != nil
             let music = info.bundleIdentifier == "com.apple.Music"
             let spotifyApp = info.bundleIdentifier == "com.spotify.client"
-            let liked = (spotifyApp && spotify.isLiked) || (youtube && ytMusic.liked)
+            // YouTube's state counts only while its tab is the source (it lingers from the last song).
+            let liked = (spotifyApp && spotify.isLiked) || (youtube && ytMusic.active && ytMusic.liked)
                 || (music && media.musicFavorited)
             // Each service's own control: Apple Music "Favourite" (star), Spotify "Liked Songs"
             // (plus → green tick), YouTube Music "Like" (thumbs up); a heart elsewhere.
@@ -714,7 +727,7 @@ private struct NowPlayingPage: View {
                     if youtube { YTMusicBridge.shared.refresh() } else { AppActions.shared.openSettingsPage("integrations") }
                 }
             }
-            .help(spotify.busyUntil != nil && !youtube ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? likeLabel : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Notifications & Apps to like songs"))
+            .help(spotify.busyUntil != nil && spotifyApp ? "Spotify is busy — likes paused for a few minutes" : info.canLike ? likeLabel : (youtube ? (ytMusic.needsAppleEvents ?? "Open YouTube Music in the browser") : "Connect Spotify in Settings › Notifications & Apps to like songs"))
         } else if choice == "repeat" {
             control(info.repeatMode == 2 ? "repeat.1" : "repeat", 16, dim: !info.repeatOn, tint: info.repeatOn ? media.artworkColor : nil) { media.toggleRepeat() }
         } else if choice == "none" {

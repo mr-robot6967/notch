@@ -36,7 +36,7 @@ final class YTMusicBridge: ObservableObject {
 
     // YouTube Music's player bar. Like state is the like renderer's `like-status` attribute;
     // repeat state is in the repeat button's title ("Repeat off / all / one").
-    private nonisolated static let stateJS = "(function(){var b=document.querySelector('ytmusic-player-bar');if(!b)return '';var r=b.querySelector('.repeat');var l=b.querySelector('ytmusic-like-button-renderer');var t=r?((r.getAttribute('title')||r.getAttribute('aria-label')||'')+'').toLowerCase():'';return JSON.stringify({repeat:t.indexOf('one')>=0?2:(t.indexOf('all')>=0?3:1),like:l?(l.getAttribute('like-status')||''):''});})()"
+    private nonisolated static let stateJS = "(function(){var b=document.querySelector('ytmusic-player-bar');if(!b)return '';var r=b.querySelector('.repeat');var l=b.querySelector('ytmusic-like-button-renderer');var t=r?((r.getAttribute('title')||r.getAttribute('aria-label')||'')+'').toLowerCase():'';var m=navigator.mediaSession&&navigator.mediaSession.metadata;var n=b.querySelector('.title');return JSON.stringify({repeat:t.indexOf('one')>=0?2:(t.indexOf('all')>=0?3:1),like:l?(l.getAttribute('like-status')||''):'',title:(m&&m.title)||(n&&n.textContent)||''});})()"
     private nonisolated static let likeJS = "(function(){var l=document.querySelector('ytmusic-player-bar ytmusic-like-button-renderer');if(!l)return '';var b=l.querySelector('#button-shape-like button')||l.querySelector('[aria-label=\"Like\"]')||l.querySelector('button');if(b){b.click();return 'ok';}return '';})()"
     private nonisolated static let shuffleJS = "(function(){var b=document.querySelector('ytmusic-player-bar .shuffle');if(b){b.click();return 'ok';}return '';})()"
     private nonisolated static let repeatJS = "(function(){var b=document.querySelector('ytmusic-player-bar .repeat');if(b){b.click();return 'ok';}return '';})()"
@@ -112,6 +112,15 @@ final class YTMusicBridge: ObservableObject {
                     bridge.noteError(error, browser: browser)
                     guard let value, let data = value.data(using: .utf8),
                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        bridge.active = false
+                        return
+                    }
+                    // The tab's song must be the one playing: with a paused YouTube Music tab open,
+                    // a YouTube video (or any site) in the same browser was taken for YouTube Music —
+                    // it lost Now Watching, and Like pressed the other tab's button.
+                    let tabTitle = (json["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let playing = (MediaController.shared.info?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !tabTitle.isEmpty, !playing.isEmpty, tabTitle.caseInsensitiveCompare(playing) != .orderedSame {
                         bridge.active = false
                         return
                     }

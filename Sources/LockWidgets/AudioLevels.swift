@@ -157,9 +157,9 @@ final class AudioLevels: ObservableObject {
     }
 
     private func shutdownForQuit() {
-        guard engine != nil else { return }
-        stop()
-        // Wait (briefly) for the teardown queued by stop() so the private device and tap are gone.
+        if engine != nil { stop() }
+        // Wait (briefly) for any teardown already queued (by stop() here, or by a linger-stop just
+        // before quitting, when `engine` is already nil) so the private device and tap are gone.
         let done = DispatchSemaphore(value: 0)
         controlQueue.async { done.signal() }
         _ = done.wait(timeout: .now() + 1)

@@ -33,7 +33,7 @@
     <key>NSCalendarsUsageDescription</key>
     <string>Notch shows your next event in the calendar widget.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Notch controls Music, Spotify or YouTube Music in your browser from the notch and shows album art.</string>
+    <string>Notch controls Music, Spotify or YouTube Music in your browser from the notch, shows album art, and reads the title of the video you're watching in your browser.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Notch shows a notch alert with the battery level when AirPods or other Bluetooth devices connect.</string>
     <key>NSAudioCaptureUsageDescription</key>
