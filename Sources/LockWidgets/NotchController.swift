@@ -1231,7 +1231,7 @@ final class NotchController {
     /// Returns false when the island can't open (Compact only, locked…) so the caller opens the app.
     @discardableResult
     func openReply(to note: MirroredNotification) -> Bool {
-        guard note.canReply, settings.config.notchExpandMode != .never, !model.locked, !hiddenForFullscreen else { return false }
+        guard note.canReply, !settingUp, settings.config.notchExpandMode != .never, !model.locked, !hiddenForFullscreen else { return false }
         model.forcedPage = .notifications
         let reply = ReplyState.shared
         reply.activeID = note.id
@@ -1249,7 +1249,11 @@ final class NotchController {
 
     /// Opens the island. `page` is a page this opening is for (a drop → the shelf, a reply →
     /// Notifications); without one, an opening picks its page from context (see pickPageForOpening).
+    /// During first-time setup the island stays closed: the welcome window is in charge.
+    var settingUp: Bool { !settings.config.onboardingDone || OnboardingController.shared.isShowing }
+
     func expand(on page: NotchPage? = nil) {
+        guard !settingUp else { return }
         // Hidden over a fullscreen app the panel is transparent and ignores the mouse, so an island
         // opened from the context menu or Settings there would stay open, invisibly, until later.
         guard settings.config.notchEnabled, settings.config.notchExpandMode != .never, !model.locked,
@@ -1358,7 +1362,7 @@ final class NotchController {
     /// Keep the drop catcher over the notch whenever drops could be taken, and over the whole
     /// open island while a drag is on it.
     func syncDropCatcher() {
-        let ok = settings.config.notchEnabled && settings.config.notchExpandMode != .never
+        let ok = !settingUp && settings.config.notchEnabled && settings.config.notchExpandMode != .never
             && settings.config.notchPages.contains(NotchPage.shelf.rawValue)
             && !model.locked && !hiddenForFullscreen && panel.isVisible
         guard ok else {

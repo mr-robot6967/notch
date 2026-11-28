@@ -11,6 +11,8 @@ import SwiftUI
 final class OnboardingController {
     static let shared = OnboardingController()
     private var window: NSWindow?
+    /// The welcome/setup window is on screen.
+    var isShowing: Bool { window != nil }
 
     static let panelSize = CGSize(width: 440, height: 500)
 
