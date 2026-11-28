@@ -1,5 +1,7 @@
 import AppKit
 
+/// Temporary drag diagnostics (drag events only) for testing on the user's Mac.
+
 
 /// Drag-and-drop onto the island. The island's own window lives in a SkyLight space above the lock
 /// screen at the shielding level, and macOS doesn't deliver drags to it. So a plain, almost-clear
@@ -11,7 +13,34 @@ final class DropCatcher {
     static let shared = DropCatcher()
     private var panel: NSPanel?
     /// A drag is over the catcher (or just left it): it covers the whole open island meanwhile.
-    var dragActive = false
+    var dragActive = false {
+        didSet { if dragActive != oldValue { dragActive ? startWatchdog() : stopWatchdog() } }
+    }
+    /// The mouse-up that ends a drag doesn't always reach us; never stay enlarged after release.
+    private var watchdog: Timer?
+    private var releasedSince: Date?
+
+    private func startWatchdog() {
+        stopWatchdog()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let catcher = DropCatcher.shared
+                if NSEvent.pressedMouseButtons & 1 != 0 { catcher.releasedSince = nil; return }
+                let since = catcher.releasedSince ?? Date()
+                catcher.releasedSince = since
+                // Give macOS time to deliver a drop after the button comes up.
+                if Date().timeIntervalSince(since) > 0.6 { catcher.endDrag() }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
+    }
+
+    private func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+        releasedSince = nil
+    }
     fileprivate var exitWork: DispatchWorkItem?
 
     var isShowing: Bool { panel?.isVisible ?? false }
@@ -44,8 +73,8 @@ final class DropCatcher {
         let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.isOpaque = false
-        // Fully clear pixels are click- and drop-through; a barely-there fill keeps it a target.
-        panel.backgroundColor = NSColor(white: 0, alpha: 0.01)
+        // Fully clear: with ignoresMouseEvents explicitly false the window still takes drags.
+        panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false

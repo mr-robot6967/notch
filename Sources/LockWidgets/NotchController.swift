@@ -1456,7 +1456,7 @@ final class NotchController {
         if dragging && !dragFromIsland && !DropCatcher.shared.dragActive && !model.locked
             && settings.config.notchExpandMode != .never
             && settings.config.notchPages.contains(NotchPage.shelf.rawValue)
-            && mouse.y > geometry.screenTop - 160 && abs(mouse.x - geometry.centerX) < geometry.width / 2 + 220
+            && mouse.y > geometry.screenTop - 260 && abs(mouse.x - geometry.centerX) < geometry.width / 2 + 340
             && Self.dragCarriesFiles() {
             DropCatcher.shared.dragActive = true
             dropDragEntered()
