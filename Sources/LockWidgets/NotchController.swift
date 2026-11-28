@@ -959,6 +959,7 @@ final class NotchController {
         let hide = settings.config.notchEnabled && !model.locked && (fullscreen || missionControl)
         guard hide != hiddenForFullscreen || panel.alphaValue != (hide ? 0 : 1) else { return }
         hiddenForFullscreen = hide
+        defer { syncDropCatcher() }
         updateFullscreenPolling() // while hidden, keep polling to catch the exit
         if hide {
             panel.ignoresMouseEvents = true
@@ -1300,7 +1301,7 @@ final class NotchController {
         let handler: (NSEvent) -> Void = { event in
             MainActor.assumeIsolated { AppDelegate.shared?.notch?.handle(event) }
         }
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .leftMouseUp, .scrollWheel]
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .scrollWheel]
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler) { monitors.append(global) }
         if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
             handler(event)
@@ -1313,8 +1314,67 @@ final class NotchController {
         if event.type == .scrollWheel {
             handleScroll(event)
         } else {
+            if event.type == .leftMouseDown {
+                // Dragging a shelf item out starts on the island; any other drag is incoming.
+                dragFromIsland = islandRect(padding: model.expanded ? 18 : 6).contains(NSEvent.mouseLocation)
+            }
             mouseMoved()
         }
+    }
+
+    private var dragFromIsland = false
+
+    /// The current drag carries files or images (not just a link, text or a browser tab).
+    private static func dragCarriesFiles() -> Bool {
+        let types = NSPasteboard(name: .drag).types ?? []
+        return types.contains(.fileURL) || types.contains(.tiff) || types.contains(.png)
+    }
+
+    /// The physical notch (a little wider, and past the top edge) — nothing underneath to block.
+    private func notchCatchRect() -> NSRect {
+        let g = geometry
+        return NSRect(x: g.centerX - g.width / 2 - 4, y: g.screenTop - g.height, width: g.width + 8, height: g.height + 6)
+    }
+
+    /// While dragging: the notch plus ~220 pt each side and a little lower, so a drag that arrives
+    /// near the notch (not dead on it) still opens the shelf.
+    private func dragApproachRect() -> NSRect {
+        let g = geometry
+        let side: CGFloat = 220
+        let height = g.height + 40
+        return NSRect(x: g.centerX - g.width / 2 - side, y: g.screenTop - height,
+                      width: g.width + 2 * side, height: height + 6)
+    }
+
+    /// Keep the drop catcher over the notch whenever drops could be taken, and over the whole
+    /// open island while a drag is on it.
+    func syncDropCatcher() {
+        let ok = settings.config.notchEnabled && settings.config.notchExpandMode != .never
+            && settings.config.notchPages.contains(NotchPage.shelf.rawValue)
+            && !model.locked && !hiddenForFullscreen && panel.isVisible
+        guard ok else {
+            if DropCatcher.shared.isShowing { DropCatcher.shared.hide() }
+            return
+        }
+        let rect: NSRect
+        if DropCatcher.shared.dragActive {
+            rect = islandRect(padding: 18)
+        } else if NSEvent.pressedMouseButtons & 1 != 0 && !dragFromIsland {
+            // Something is being dragged: you only need to get near the notch, not exactly on it.
+            rect = dragApproachRect()
+        } else {
+            rect = notchCatchRect()
+        }
+        DropCatcher.shared.show(over: rect)
+    }
+
+    /// A drag reached the notch: open on the shelf, let the drag through the island, and grow the
+    /// catcher to the open island once it has resized.
+    func dropDragEntered() {
+        panel.ignoresMouseEvents = true
+        if !model.expanded || model.page != .shelf { expand(on: .shelf) }
+        syncDropCatcher()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in self?.syncDropCatcher() }
     }
 
     /// Two-finger swipes over the island: horizontal = previous/next track, vertical = change page,
@@ -1388,16 +1448,27 @@ final class NotchController {
         let inside = islandRect(padding: model.expanded ? 18 : 6).contains(mouse)
         // Accept clicks/drops only over the island; everywhere else clicks pass through.
         panel.ignoresMouseEvents = !inside
-        // Drops can't reach the island's lock-screen-space window, so while dragging over it a
-        // normal window catches them (DropCatcher) and the island steps aside for the drag.
-        // It's put up as soon as any drag starts (drop targets must exist before the drag arrives),
-        // covering the island, so the drag never falls through to Mission Control's top edge.
-        if dragging && settings.config.notchPages.contains(NotchPage.shelf.rawValue) && !model.locked {
-            DropCatcher.shared.show(over: islandRect(padding: model.expanded ? 18 : 6))
-            panel.ignoresMouseEvents = true
-        } else if !dragging, DropCatcher.shared.isShowing {
-            DropCatcher.shared.hide()
+        // Drops can't reach the island's lock-screen-space window; DropCatcher (a normal window over
+        // the notch) takes them. During a drag that didn't start on the island, let it through.
+        if dragging && !dragFromIsland { panel.ignoresMouseEvents = true }
+        // Open the shelf to meet a dragged FILE before it reaches the menu-bar strip: holding a file
+        // up there makes macOS open Mission Control (to drop it on another Space) and steals the drop.
+        if dragging && !dragFromIsland && !DropCatcher.shared.dragActive && !model.locked
+            && settings.config.notchExpandMode != .never
+            && settings.config.notchPages.contains(NotchPage.shelf.rawValue)
+            && mouse.y > geometry.screenTop - 160 && abs(mouse.x - geometry.centerX) < geometry.width / 2 + 220
+            && Self.dragCarriesFiles() {
+            DropCatcher.shared.dragActive = true
+            dropDragEntered()
         }
+        // On release, macOS delivers the drop a moment after the button comes up; shrinking the
+        // catcher right away would pull it out from under the drop. Tidy up only if no drop came.
+        if !dragging, DropCatcher.shared.dragActive {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if NSEvent.pressedMouseButtons & 1 == 0, DropCatcher.shared.dragActive { DropCatcher.shared.endDrag() }
+            }
+        }
+        syncDropCatcher()
         let inZone = hoverZone().contains(mouse)
         if inside != model.hovering || inZone != lastInZone {
             lastInZone = inZone

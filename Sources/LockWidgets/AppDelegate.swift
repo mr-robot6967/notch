@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var notch: NotchController?
     private var settingsWindow: SettingsWindowController?
     private var statusItem: NSStatusItem?
+    /// The popover-style panel a click on the status item opens (right-click shows `classicMenu`).
+    private(set) var menuPanel: MenuPanelController?
+    private var classicMenu: NSMenu?
     private var cancellables = Set<AnyCancellable>()
     private var appearanceObservation: NSKeyValueObservation?
 
@@ -80,7 +83,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         setUpStatusItem()
         settings.$config.map(\.showMenuBarIcon).removeDuplicates().receive(on: RunLoop.main)
-            .sink { [weak self] show in self?.statusItem?.isVisible = show }
+            .sink { [weak self] show in
+                self?.statusItem?.isVisible = show
+                if !show { self?.menuPanel?.close() }
+            }
             .store(in: &cancellables)
         // Update available: badge the menu bar icon and post one notification per new version.
         Updater.shared.$state.removeDuplicates().receive(on: RunLoop.main)
@@ -168,7 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
-        item.menu = menu
+        // Left click opens the panel; right-click (or Control-click) shows this classic menu.
+        classicMenu = menu
+        menuPanel = MenuPanelController()
+        item.button?.target = self
+        item.button?.action = #selector(statusItemClicked(_:))
+        item.button?.sendAction(on: [.leftMouseDown, .rightMouseDown])
         statusItem = item
         // The badged icon isn't a template, so it's redrawn when the menu bar turns light/dark.
         appearanceObservation = item.button?.observe(\.effectiveAppearance, options: [.new]) { _, _ in
@@ -176,6 +187,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 MainActor.assumeIsolated { AppDelegate.shared?.refreshStatusIcon() }
             }
         }
+    }
+
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseDown || event?.modifierFlags.contains(.control) == true {
+            menuPanel?.close()
+            guard let item = statusItem, let menu = classicMenu else { return }
+            item.menu = menu
+            sender.performClick(nil) // tracks the menu until it closes
+            item.menu = nil
+            return
+        }
+        menuPanel?.toggle(from: sender)
     }
 
     private var statusIconBadged = false

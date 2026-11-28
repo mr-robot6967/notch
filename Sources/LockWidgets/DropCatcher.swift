@@ -1,13 +1,18 @@
 import AppKit
 
-/// The island's window lives in a SkyLight space above the lock screen, and macOS doesn't route
-/// drag-and-drop to windows there. While something is dragged over the island, this plain,
-/// almost-transparent window sits over it in the normal spaces, catches the drop and hands the
-/// items to the File Shelf.
+
+/// Drag-and-drop onto the island. The island's own window lives in a SkyLight space above the lock
+/// screen at the shielding level, and macOS doesn't deliver drags to it. So a plain, almost-clear
+/// window always sits over the physical notch (nothing is underneath it to block). When a drag
+/// reaches it, it opens the File Shelf, grows to cover the open island, takes the drop, and then
+/// shrinks back to the notch.
 @MainActor
 final class DropCatcher {
     static let shared = DropCatcher()
     private var panel: NSPanel?
+    /// A drag is over the catcher (or just left it): it covers the whole open island meanwhile.
+    var dragActive = false
+    fileprivate var exitWork: DispatchWorkItem?
 
     var isShowing: Bool { panel?.isVisible ?? false }
 
@@ -19,8 +24,20 @@ final class DropCatcher {
     }
 
     func hide() {
+        exitWork?.cancel()
+        exitWork = nil
+        dragActive = false
         panel?.orderOut(nil)
         if NotchModel.shared.dropTargeted { NotchModel.shared.dropTargeted = false }
+    }
+
+    /// The drag finished or left for good: go back to covering just the notch.
+    func endDrag() {
+        exitWork?.cancel()
+        exitWork = nil
+        dragActive = false
+        if NotchModel.shared.dropTargeted { NotchModel.shared.dropTargeted = false }
+        AppDelegate.shared?.notch?.syncDropCatcher()
     }
 
     private func makePanel() -> NSPanel {
@@ -34,8 +51,7 @@ final class DropCatcher {
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = false
         panel.animationBehavior = .none
-        // macOS doesn't deliver drags to windows at the island's shielding level, so this sits just
-        // above the menu bar (the island lets mouse events through while a drag is on).
+        // A normal level just above the menu bar: drags are delivered here (not at shielding level).
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = DropCatcherView(frame: .zero)
@@ -57,16 +73,28 @@ private final class DropCatcherView: NSView {
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard shelfOn else { return [] }
+        let catcher = DropCatcher.shared
+        catcher.exitWork?.cancel()
+        catcher.exitWork = nil
         NotchModel.shared.dropTargeted = true
+        if !catcher.dragActive {
+            catcher.dragActive = true
+            AppDelegate.shared?.notch?.dropDragEntered()
+        }
         return .copy
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        shelfOn ? .copy : []
+        return shelfOn ? .copy : []
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
         NotchModel.shared.dropTargeted = false
+        // Growing to the open island can briefly read as an exit; only give up if it stays gone.
+        let work = DispatchWorkItem { DropCatcher.shared.endDrag() }
+        DropCatcher.shared.exitWork?.cancel()
+        DropCatcher.shared.exitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -89,10 +117,10 @@ private final class DropCatcherView: NSView {
     }
 
     override func concludeDragOperation(_ sender: NSDraggingInfo?) {
-        DropCatcher.shared.hide()
+        DropCatcher.shared.endDrag()
     }
 
     override func draggingEnded(_ sender: NSDraggingInfo) {
-        DropCatcher.shared.hide()
+        DropCatcher.shared.endDrag()
     }
 }
