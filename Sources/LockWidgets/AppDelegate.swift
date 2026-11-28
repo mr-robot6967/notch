@@ -18,10 +18,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindow: SettingsWindowController?
     private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
+    private var appearanceObservation: NSKeyValueObservation?
 
     override init() {
         super.init()
         AppDelegate.shared = self
+    }
+
+    /// The notification delegate must be set before launch finishes, so a click that launched
+    /// the app is still delivered.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if Snapshot.outputDirectory == nil { UpdateNotifier.shared.install() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -77,6 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.$config.map(\.showMenuBarIcon).removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] show in self?.statusItem?.isVisible = show }
             .store(in: &cancellables)
+        // Update available: badge the menu bar icon and post one notification per new version.
+        Updater.shared.$state.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] state in
+                self?.refreshStatusIcon(updateAvailable: { if case .available = state { return true }; return false }())
+                if case .available(let version) = state { UpdateNotifier.shared.notifyIfNeeded(version: version) }
+            }
+            .store(in: &cancellables)
 
         if !settings.config.hasLaunchedBefore {
             settings.config.hasLaunchedBefore = true
@@ -84,6 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if settings.config.onboardingDone { settingsWindow?.show() }
         }
         enableLaunchAtLoginOnce()
+        // After an update, show what changed (once). Not over the first-run welcome.
+        WhatsNewController.shared.showIfUpdated(suppress: !settings.config.onboardingDone
+                                                || CommandLine.arguments.contains("--welcome"))
 
         if CommandLine.arguments.contains("--open-settings") { settingsWindow?.show() }
         // First launch (or --welcome): greeting, features, permissions.
@@ -148,12 +165,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(menuItem("Refresh Now", #selector(refresh), key: "r"))
         menu.addItem(menuItem("Check for Updates…", #selector(updateAction), tag: .update))
+        menu.addItem(menuItem("What's New…", #selector(showWhatsNew)))
         menu.addItem(menuItem("Settings…", #selector(openSettings), key: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         item.menu = menu
         statusItem = item
+        // The badged icon isn't a template, so it's redrawn when the menu bar turns light/dark.
+        appearanceObservation = item.button?.observe(\.effectiveAppearance, options: [.new]) { _, _ in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { AppDelegate.shared?.refreshStatusIcon() }
+            }
+        }
+    }
+
+    private var statusIconBadged = false
+
+    /// Normal template icon, or the same glyph with a small red dot while an update is available.
+    private func refreshStatusIcon(updateAvailable: Bool? = nil) {
+        if let updateAvailable { statusIconBadged = updateAvailable }
+        guard let button = statusItem?.button else { return }
+        button.image = statusIconBadged
+            ? MenuBarIcon.makeBadged(appearance: button.effectiveAppearance)
+            : MenuBarIcon.make()
     }
 
     private func menuItem(_ title: String, _ action: Selector, key: String = "", tag: Tag? = nil) -> NSMenuItem {
@@ -176,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func previewLockScreen() { lockOverlay?.preview() }
     @objc private func refresh() { store.refreshAll(); baker?.bake() }
     @objc private func openSettings() { settingsWindow?.show() }
+    @objc private func showWhatsNew() { WhatsNewController.shared.show() }
     /// "Update to X…" installs; otherwise checks now and shows the result in Settings › General.
     @objc private func updateAction() {
         if Updater.shared.updateAvailable {

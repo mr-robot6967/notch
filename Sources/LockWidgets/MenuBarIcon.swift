@@ -35,4 +35,35 @@ enum MenuBarIcon {
         image.accessibilityDescription = "Notch"
         return image
     }
+
+    /// The icon with Apple's small "attention" dot at the top right. Template images can't carry
+    /// colour, so this is a plain image drawn in the menu bar's label colour for `appearance`
+    /// (rebuild it when the appearance changes).
+    static func makeBadged(appearance: NSAppearance, size: CGFloat = 18) -> NSImage {
+        let template = make(size: size)
+        let canvas = template.size
+        let image = NSImage(size: canvas, flipped: false) { rect in
+            appearance.performAsCurrentDrawingAppearance {
+                guard let ctx = NSGraphicsContext.current else { return }
+                // Icon tinted with the label colour.
+                template.draw(in: rect)
+                ctx.compositingOperation = .sourceAtop
+                NSColor.labelColor.setFill()
+                rect.fill()
+
+                // Knock a small gap around the dot so it reads cleanly over the pill outline.
+                let dot = size * 0.30
+                let dotRect = NSRect(x: rect.maxX - dot, y: rect.maxY - dot - size * 0.08, width: dot, height: dot)
+                ctx.compositingOperation = .clear
+                NSBezierPath(ovalIn: dotRect.insetBy(dx: -1.25, dy: -1.25)).fill()
+                ctx.compositingOperation = .sourceOver
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: dotRect).fill()
+            }
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "Notch, update available"
+        return image
+    }
 }

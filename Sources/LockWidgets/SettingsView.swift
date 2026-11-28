@@ -1689,17 +1689,17 @@ private struct UpdatesSection: View {
             LabeledContent("Installed version", value: updater.currentVersion)
             switch updater.state {
             case .available(let version):
-                HStack {
-                    Label("Notch \(version) is available", systemImage: "arrow.down.circle.fill").foregroundStyle(.blue)
-                    Spacer()
-                    Button("Update Now") { updater.install() }.buttonStyle(.borderedProminent)
-                }
+                Label("Notch \(version) is available", systemImage: "arrow.down.circle.fill").foregroundStyle(.blue)
                 if !updater.releaseNotes.isEmpty {
                     ScrollView {
-                        Text(updater.releaseNotes).font(.caption).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                        ReleaseNotesView(markdown: updater.releaseNotes, compact: true)
+                            .padding(.vertical, 2)
                     }
-                    .frame(maxHeight: 120)
+                    .frame(maxHeight: 160)
+                }
+                HStack {
+                    Spacer()
+                    Button("Update Now") { updater.install() }.buttonStyle(.borderedProminent)
                 }
             case .downloading:
                 HStack { ProgressView().controlSize(.small); Text("Downloading the update…") }
@@ -1718,8 +1718,11 @@ private struct UpdatesSection: View {
                 EmptyView()
             }
             Toggle("Check for updates automatically", isOn: $settings.config.autoCheckUpdates)
-            Button("Check Now") { updater.check() }
-                .disabled(updater.state == .checking || updater.state == .downloading || updater.state == .installing)
+            HStack {
+                Button("Check Now") { updater.check() }
+                    .disabled(updater.state == .checking || updater.state == .downloading || updater.state == .installing)
+                Button("What's New…") { WhatsNewController.shared.show() }
+            }
         }
     }
 }
