@@ -1067,14 +1067,16 @@ final class NotchController {
     private func deviceActivity(_ name: String) -> LiveActivity {
         let matches = store.peripherals.filter { Self.deviceNamesMatch($0.name, name) }
         let level = matches.filter { $0.component != "Case" }.map(\.level).min() ?? matches.first?.level
-        // Both buds → the pair icon; one bud → that bud; otherwise the device's own icon.
+        // Both buds → the pair AirPods glyph; one bud → that bud; otherwise the device's own icon
+        // (AirPods that report as a single device land in .headphones, so route those by name too).
         let buds = matches.filter { $0.kind == .earbudLeft || $0.kind == .earbudRight }
-        let pair = name.lowercased().contains("pro") ? "airpodspro" : "airpods"
         let symbol: String
         if buds.contains(where: { $0.kind == .earbudLeft }) && buds.contains(where: { $0.kind == .earbudRight }) {
-            symbol = pair
+            symbol = SFSymbol.earbuds(for: name)
         } else if let bud = buds.first {
             symbol = bud.kind.symbol
+        } else if name.lowercased().contains("airpod") {
+            symbol = SFSymbol.earbuds(for: name)
         } else {
             symbol = matches.first?.kind.symbol ?? DeviceKind.guess(from: name).symbol
         }
@@ -1090,6 +1092,11 @@ final class NotchController {
     func islandSize() -> CGSize {
         let g = geometry
         let k = scale
+        // Compact-activity labels use a FIXED point size, so their width must not shrink below the
+        // k = 1 budget on small notches / the short non-notch pill (where k clamps to 0.75) — that is
+        // what clipped "On Hold" and long device names. `t` grows the text budget on big notches but
+        // never shrinks it below the fixed-text worst case, so content always fits any notch width.
+        let t = max(k, 1)
         if model.expanded { return CGSize(width: max(368 * k, g.width + 160 * k), height: 179.5 * k) }
         let content = NotchContent.current(model: model)
         // Breathe a little when the pointer reaches the notch, so it feels alive.
@@ -1098,37 +1105,42 @@ final class NotchController {
         if case .transient(.songChange) = content { return CGSize(width: max(300 * k, g.width + 92 * k), height: 80 * k) }
         switch content {
         case .idle: return CGSize(width: g.width + 6 * k * grow, height: g.height + 2 * k * grow)
-        case .nowPlaying: return CGSize(width: g.width + 2 * 37 * k + 4 * k * grow, height: g.height + 1.5 * k * grow)
-        case .watching: return CGSize(width: g.width + 2 * 100 * k, height: g.height + 1.5 * k * grow)
-        case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * k, height: g.height)
-        case .device: return CGSize(width: g.width + 2 * 82 * k, height: g.height)
-        case .transient(.event): return CGSize(width: g.width + 2 * 110 * k, height: g.height)
+        case .nowPlaying: return CGSize(width: g.width + 2 * 37 * t + 4 * k * grow, height: g.height + 1.5 * k * grow)
+        case .watching: return CGSize(width: g.width + 2 * 100 * t, height: g.height + 1.5 * k * grow)
+        case .hud: return CGSize(width: g.width + 2 * (settings.config.hudShowsPercent ? 92 : 66) * t, height: g.height)
+        case .device: return CGSize(width: g.width + 2 * 96 * t, height: g.height)
+        case .transient(.event): return CGSize(width: g.width + 2 * 110 * t, height: g.height)
         case .transient(.charging(_, let state)):
-            // Room for "On Hold 100%" + battery icon on one line.
-            return CGSize(width: g.width + 2 * (state == .onHold || state == .charged ? 128 : 80) * k, height: g.height)
-        case .transient(.lowPower): return CGSize(width: g.width + 2 * 80 * k, height: g.height)
-        case .transient(.focus): return CGSize(width: g.width + 2 * 64 * k, height: g.height)
-        case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * k, height: g.height)
-        case .timer: return CGSize(width: g.width + 2 * 70 * k, height: g.height)
+            // Room for "On Hold 100%" + battery icon on one line (fixed-size, so use `t`, not `k`).
+            return CGSize(width: g.width + 2 * (state == .onHold || state == .charged ? 132 : 80) * t, height: g.height)
+        case .transient(.lowPower): return CGSize(width: g.width + 2 * 80 * t, height: g.height)
+        case .transient(.focus): return CGSize(width: g.width + 2 * 64 * t, height: g.height)
+        case .transient(.lowBattery): return CGSize(width: g.width + 2 * 60 * t, height: g.height)
+        case .timer: return CGSize(width: g.width + 2 * 70 * t, height: g.height)
         case .locked: return CGSize(width: g.width + 2 * (g.height * 0.8), height: g.height)
         // At least 42 pt a side: the 12 pt temperature ("-12°") didn't fit in 0.95 × a short notch
         // (or the pill on Macs without one) and wrapped/truncated.
         case .idleWeather: return CGSize(width: g.width + 2 * max(g.height * 0.95, 42), height: g.height)
-        case .idleNotPlaying: return CGSize(width: g.width + 2 * 84 * k, height: g.height) // fits "Not playing"
-        default: return CGSize(width: g.width + 2 * 50 * k, height: g.height)
+        case .idleNotPlaying: return CGSize(width: g.width + 2 * 84 * t, height: g.height) // fits "Not playing"
+        default: return CGSize(width: g.width + 2 * 50 * t, height: g.height)
         }
     }
 
     /// Where hovering opens the island: the notch itself at the top edge, not the area around it.
+    /// Only the middle of the notch opens it, so brushing a corner on the way to the menu bar doesn't.
+    /// It reaches a few points above the screen's top edge: the pointer pinned at the very top row
+    /// (y == screenTop) must still count as inside, since NSRect.contains excludes its max edge.
     private func hoverZone() -> NSRect {
         let g = geometry
-        return NSRect(x: g.centerX - g.width / 2 - 4, y: g.screenTop - g.height, width: g.width + 8, height: g.height + 1)
+        let w = g.width * 0.7
+        return NSRect(x: g.centerX - w / 2, y: g.screenTop - g.height, width: w, height: g.height + 6)
     }
 
     private func islandRect(padding: CGFloat) -> NSRect {
         let size = islandSize()
+        // +6 above the top edge so pushing the pointer to the very top doesn't count as leaving.
         return NSRect(x: geometry.centerX - size.width / 2 - padding, y: geometry.screenTop - size.height - padding,
-                      width: size.width + 2 * padding, height: size.height + padding)
+                      width: size.width + 2 * padding, height: size.height + padding + 6)
     }
 
     /// Tapping a replyable banner: open the island on Notifications with that message's reply field.
@@ -1255,9 +1267,12 @@ final class NotchController {
         let threshold: CGFloat = 38
         if abs(scrollX) > threshold, abs(scrollX) > abs(scrollY) * 1.4, settings.config.swipeToSkip, MediaController.shared.info != nil {
             // scrollX runs opposite to the fingers: swipe left (scrollX > 0) = next song, right = previous.
-            scrollX > 0 ? MediaController.shared.next() : MediaController.shared.previous()
-            // Jiggle the island the way the fingers moved.
-            model.jiggle(scrollX > 0 ? -1 : 1)
+            // swipeSkipReversed flips the final decision deterministically for Macs whose device
+            // reports the opposite horizontal direction, keeping the natural-scroll normalization above.
+            let dir = (scrollX > 0) != settings.config.swipeSkipReversed
+            dir ? MediaController.shared.next() : MediaController.shared.previous()
+            // Jiggle to match the skip decision (next lurches left, previous right — the original feel).
+            model.jiggle(dir ? -1 : 1)
             gestureDone()
         } else if abs(scrollY) > threshold, abs(scrollY) > abs(scrollX) * 1.4 {
             if !model.expanded {

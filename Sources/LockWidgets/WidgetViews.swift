@@ -746,7 +746,8 @@ struct MacBatteryWidget: View {
     var body: some View {
         if let b = store.mac {
             let tint = batteryTint(level: b.level, charging: b.isCharging, settings: settings, theme: theme)
-            let symbol = BatteryLook.symbol(for: b.level, charging: b.isCharging)
+            // On hold shows the same plug glyph as the island's "On Hold" pop-up.
+            let symbol = b.chargeState == .onHold ? "powerplug.fill" : BatteryLook.symbol(for: b.level, charging: b.isCharging)
             if size == .compact {
                 RoundTile {
                     RingGauge(fraction: Double(b.level) / 100, tint: tint) {
@@ -807,7 +808,7 @@ struct PeripheralsWidget: View {
                     RoundTile {
                         RingGauge(fraction: Double(d.level) / 100,
                                   tint: batteryTint(level: d.level, charging: d.isCharging, settings: settings, theme: theme)) {
-                            Image(systemName: d.kind.symbol).font(.system(size: 22 * k, weight: .semibold))
+                            Image(systemName: SFSymbol.symbol(for: d)).font(.system(size: 22 * k, weight: .semibold))
                         }
                     } caption: {
                         Text(settings.config.showPercentText ? "\(d.level)%" : d.component ?? d.name)
@@ -821,10 +822,10 @@ struct PeripheralsWidget: View {
                     ForEach(devices) { d in
                         let tint = batteryTint(level: d.level, charging: d.isCharging, settings: settings, theme: theme)
                         HStack(spacing: 10 * k) {
-                            Image(systemName: d.kind.symbol)
+                            Image(systemName: SFSymbol.symbol(for: d))
                                 .font(.system(size: 15 * k, weight: .semibold))
                                 .frame(width: 22 * k)
-                            Text(d.displayName).font(rounded(13 * k, .medium)).lineLimit(1)
+                            Text(d.displayName).font(rounded(13 * k, .medium)).lineLimit(1).truncationMode(.tail)
                             Spacer(minLength: 10 * k)
                             Capsule().fill(theme.track).frame(width: 60 * k, height: 6 * k)
                                 .overlay(alignment: .leading) {

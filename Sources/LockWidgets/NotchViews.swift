@@ -344,7 +344,7 @@ private struct CompactActivity: View {
         case .transient(.charging(_, let state)):
             switch state {
             case .charging: Image(systemName: "bolt.fill").foregroundStyle(.green)
-            case .onHold: Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+            case .onHold: Image(systemName: "powerplug.fill").foregroundStyle(.orange)
             case .charged: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
             case .onBattery: Image(systemName: SFSymbol.unpluggedPlug).foregroundStyle(.white)
             }
@@ -397,8 +397,8 @@ private struct CompactActivity: View {
         case .device:
             if case .device(let name, _, let level) = model.transient {
                 HStack(spacing: 6) {
-                    Text(name).lineLimit(1).font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.7)).frame(maxWidth: 74)
+                    Text(name).lineLimit(1).truncationMode(.tail).font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.7)).frame(maxWidth: 96)
                     if let level { MiniRing(level: level).frame(width: 17, height: 17) }
                 }
             }
@@ -1593,4 +1593,36 @@ enum SFSymbol {
     /// "powerplug.portrait" is macOS 15+; "powerplug" exists since macOS 12.
     static let unpluggedPlug: String = NSImage(systemSymbolName: "powerplug.portrait", accessibilityDescription: nil) != nil
         ? "powerplug.portrait" : "powerplug"
+
+    /// First of `names` that actually renders on this OS; the last is the guaranteed fallback so
+    /// `Image(systemName:)` is never blank.
+    static func first(_ names: String...) -> String {
+        for name in names where NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil { return name }
+        return names.last ?? ""
+    }
+
+    /// Regular AirPods glyph: the two-earbud "airpods.gen3" where available, else the classic "airpods".
+    static let airpods: String = first("airpods.gen3", "airpods")
+
+    /// Best earbud glyph for a device name: AirPods Pro and Max keep their own symbol; everything
+    /// else (plain AirPods and the combined pair) uses the regular AirPods glyph — never a generic
+    /// headphones icon.
+    static func earbuds(for name: String) -> String {
+        let t = name.lowercased()
+        if t.contains("max") { return first("airpodsmax", "airpods.gen3", "airpods") }
+        if t.contains("pro") { return first("airpodspro", "airpods.gen3", "airpods") }
+        return airpods
+    }
+
+    /// Icon for a connected peripheral, routing AirPods (split, combined, or reported as one device)
+    /// to the AirPods glyphs and leaving every other device its own symbol.
+    static func symbol(for device: DeviceBattery) -> String {
+        switch device.kind {
+        case .earbuds: return earbuds(for: device.name)
+        case .earbudLeft: return device.kind.symbol
+        case .earbudRight: return device.kind.symbol
+        case .headphones where device.name.lowercased().contains("airpod"): return earbuds(for: device.name)
+        default: return device.kind.symbol
+        }
+    }
 }

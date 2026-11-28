@@ -123,14 +123,19 @@ struct Config: Codable, Equatable {
     // Notch island
     var notchEnabled: Bool = true
     var notchExpandMode: NotchExpandMode = .hover
-    var hoverDelay: Double = 0
+    var hoverDelay: Double = 0.15
     var hoverMigrated: Bool = true
+    var hoverDwellMigrated: Bool = true
     var contrastOutline: Bool = false
     var notchPages: [String] = NotchPage.allCases.map(\.rawValue)
     var notchWidthAdjust: Double = 0
     var notchHeightAdjust: Double = 0
     var notchHaptics: Bool = true
     var swipeToSkip: Bool = true
+    /// Flip which swipe direction skips forward. Some Macs' trackpads/mice report horizontal scroll
+    /// opposite to the natural-scroll normalization, so the user can invert it here. New default-false
+    /// bool: old configs merge over it safely, no migration flag needed.
+    var swipeSkipReversed: Bool = false
     var artworkFlip: Bool = true
     var replaceSystemHUD: Bool = true
     var hudShowsPercent: Bool = true
@@ -308,6 +313,11 @@ struct Config: Codable, Equatable {
         if saved["hoverMigrated"] == nil {
             config.hoverDelay = 0
             config.hoverMigrated = true
+        }
+        // A short dwell so brushing past the notch (e.g. heading for the menu bar) doesn't open it.
+        if saved["hoverDwellMigrated"] == nil {
+            if config.hoverDelay < 0.15 { config.hoverDelay = 0.15 }
+            config.hoverDwellMigrated = true
         }
         // Show the small lock while locked by default (older configs had "none").
         if saved["lockIndicatorMigrated"] == nil {

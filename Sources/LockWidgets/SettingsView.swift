@@ -913,7 +913,7 @@ private struct BatteriesTab: View {
                             if !show { settings.config.hiddenDevices.append(device.id) }
                         }
                     )) {
-                        Label("\(device.displayName) — \(device.level)%", systemImage: device.kind.symbol)
+                        Label("\(device.displayName) — \(device.level)%", systemImage: SFSymbol.symbol(for: device))
                     }
                 }
                 Button("Rescan devices") { store.refreshPeripherals() }
@@ -1525,6 +1525,12 @@ private struct NowPlayingSettingsPage: View {
                 Toggle("Flip album art when the song changes", isOn: $settings.config.artworkFlip)
                 Toggle("Clean up song titles", isOn: $settings.config.cleanSongTitles)
                 Toggle("Swipe left/right on the island to skip", isOn: $settings.config.swipeToSkip)
+                if settings.config.swipeToSkip {
+                    Picker("Swipe to skip", selection: $settings.config.swipeSkipReversed) {
+                        Text("Swipe left = next").tag(false)
+                        Text("Swipe left = previous").tag(true)
+                    }
+                }
                 Toggle("Jiggle the island when skipping", isOn: $settings.config.skipJiggle)
                 if settings.config.skipJiggle {
                     LabeledContent("Jiggle strength") {
